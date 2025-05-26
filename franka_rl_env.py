@@ -190,7 +190,8 @@ class FrankaShelfEnv(gym.Env):
                  franka_xml_path='xml/franka_emika_panda/panda.xml',
                  k_dist_reward=1.0, k_time_penalty=0.01, k_action_penalty=0.001,
                  k_joint_limit_penalty=10.0, k_collision_penalty=100.0,
-                 success_reward_val=200.0, success_threshold_val=0.05):
+                 success_reward_val=200.0, success_threshold_val=0.05,
+                 k_accel_penalty=0.0):  # Added k_accel_penalty with a default of 0.0
         super().__init__()
 
         self.num_envs = num_envs
@@ -242,6 +243,7 @@ class FrankaShelfEnv(gym.Env):
         self.k_dist_reward, self.k_time_penalty, self.k_action_penalty = k_dist_reward, k_time_penalty, k_action_penalty
         self.k_joint_limit_penalty, self.k_collision_penalty = k_joint_limit_penalty, k_collision_penalty
         self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
+        self.k_accel_penalty = k_accel_penalty  # Storing the new penalty coefficient
 
         self._define_shelf_configurations()
         self.current_shelf_config_key = [""] * self.num_envs
@@ -429,9 +431,14 @@ class FrankaShelfEnv(gym.Env):
         return {"robot_state_flat": robot_state_flat, "relative_target_pos": relative_target_pos, "obstacle_voxels": self.current_voxel_grid.copy()}
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
+        # Adhering to Gymnasium's reset signature
+        super().reset(seed=seed)  # Call to gym.Env.reset() for seeding internal PRNG
+        if seed is not None:  # Seed Python's random and NumPy if a seed is provided
             np.random.seed(seed)
             random.seed(seed)
+            # Note: Genesis specific global seeding might also be needed if it has its own RNG.
+            # For now, assuming gs.Scene.reset() and entity states cover sim determinism.
+
         if self.scene.is_built:
             self.scene.reset()
         self.current_step.fill(0)
@@ -451,11 +458,17 @@ class FrankaShelfEnv(gym.Env):
         self.current_voxel_grid = boxes_to_voxel_grid_batched(
             batched_box_params, self.voxel_grid_dims, self.grid_origins_batch, self.voxel_size, self.num_envs)
         obs_batch = self._get_obs_batched()
+        # Initialize with empty dicts
         infos_batch = [{} for _ in range(self.num_envs)]
+        # Populate shelf_config in info as it's set during reset
+        for i in range(self.num_envs):
+            infos_batch[i]["shelf_config"] = self.current_shelf_config_key[i]
+
         if self.num_envs == 1:
             single_obs = {key: val[0] for key, val in obs_batch.items()}
-            return single_obs, infos_batch[0]
+            return single_obs, infos_batch[0]  # Return obs, info
         else:
+            # For batched environments not wrapped by SB3 VecEnv (e.g. internal testing)
             return obs_batch, infos_batch
 
     def step(self, actions_batch):
@@ -479,7 +492,8 @@ class FrankaShelfEnv(gym.Env):
         time_penalty_b = -self.k_time_penalty * \
             np.ones(self.num_envs, dtype=np.float32)
         action_penalty_b = -self.k_action_penalty * \
-            np.sum(np.square(actions_batch), axis=1)
+            np.sum(np.square(actions_batch_clipped),
+                   axis=1)  # Penalize clipped actions
         joint_pos_penalty_b = np.zeros(self.num_envs, dtype=np.float32)
         near_limit_thresh = 0.05
         for i in range(self.FRANKA_NUM_ARM_JOINTS):
@@ -491,26 +505,79 @@ class FrankaShelfEnv(gym.Env):
                 np.maximum(0, -lower_limit_dist)
             joint_pos_penalty_b -= self.k_joint_limit_penalty * \
                 np.maximum(0, -upper_limit_dist)
+
+        # --- Collision Penalty (Modified Part) ---
         collision_penalty_val_b = np.zeros(self.num_envs, dtype=np.float32)
+        # Track collision termination per env
+        terminated_collision_b = np.zeros(self.num_envs, dtype=bool)
+
+        if self.scene.is_built and hasattr(self.scene, 'get_contacts'):
+            contacts = self.scene.get_contacts()  # This should return contacts for all envs
+            if contacts:  # Check if contacts list is not empty
+                franka_entity_id = self.franka.entity_id
+                # Create a set of shelf entity IDs for efficient lookup
+                shelf_entity_ids = {
+                    comp.entity_id for comp in self.shelf_component_entities}
+
+                for contact_info in contacts:
+                    # Assuming contact_info is an object with attributes: env_idx, entity0_id, entity1_id
+                    env_idx = contact_info.env_idx
+                    if env_idx >= self.num_envs:  # Safety check for env_idx
+                        continue
+
+                    e0_id = contact_info.entity0_id
+                    e1_id = contact_info.entity1_id
+
+                    is_franka0 = (e0_id == franka_entity_id)
+                    is_franka1 = (e1_id == franka_entity_id)
+                    is_shelf0 = (e0_id in shelf_entity_ids)
+                    is_shelf1 = (e1_id in shelf_entity_ids)
+
+                    # Check for Franka self-collision (franka vs franka)
+                    # or Franka-shelf collision (franka vs shelf component)
+                    # Self-collision (ensure not same link if detailed)
+                    if (is_franka0 and is_franka1 and e0_id != e1_id):
+                        collision_penalty_val_b[env_idx] -= self.k_collision_penalty
+                        terminated_collision_b[env_idx] = True
+                    elif (is_franka0 and is_shelf1) or (is_franka1 and is_shelf0):  # Shelf collision
+                        collision_penalty_val_b[env_idx] -= self.k_collision_penalty
+                        terminated_collision_b[env_idx] = True
+        # --- End of Collision Penalty Modification ---
+
         success_reward_val_b = np.zeros(self.num_envs, dtype=np.float32)
         terminated_success_b = dist_to_target_b < self.success_threshold
         success_reward_val_b[terminated_success_b] = self.success_reward
+
+        # --- Smoothness Penalty (Acceleration) (New Part) ---
+        accel_penalty_b = np.zeros(self.num_envs, dtype=np.float32)
+        if self.k_accel_penalty > 0 and self.dt > 0:
+            joint_accel_b = (arm_joint_vel_b - self.prev_joint_vel) / self.dt
+            accel_penalty_b = -self.k_accel_penalty * \
+                np.sum(np.square(joint_accel_b), axis=1)
+        # --- End of Smoothness Penalty ---
+
         rewards_b = reward_distance_b + time_penalty_b + action_penalty_b + \
-            joint_pos_penalty_b + collision_penalty_val_b + success_reward_val_b
-        terminated_collision_b = collision_penalty_val_b < 0
+            joint_pos_penalty_b + collision_penalty_val_b + success_reward_val_b + \
+            accel_penalty_b  # Added accel_penalty_b
+
         terminated_b = np.logical_or(
-            terminated_collision_b, terminated_success_b)
+            terminated_collision_b, terminated_success_b)  # terminated_collision_b is now properly calculated
         truncated_b = self.current_step >= self.max_steps
         observations_b = self._get_obs_batched()
         infos_b = []
         for i in range(self.num_envs):
-            infos_b.append({"is_success": terminated_success_b[i], "distance_to_target": float(dist_to_target_b[i]),
-                            "collision_detected": terminated_collision_b[i], "current_step": self.current_step[i],
+            infos_b.append({"is_success": terminated_success_b[i],
+                            "distance_to_target": float(dist_to_target_b[i]),
+                            # This now reflects actual collisions
+                            "collision_detected": terminated_collision_b[i],
+                            "current_step": self.current_step[i],
                             "shelf_config": self.current_shelf_config_key[i]})
         self.prev_joint_vel = arm_joint_vel_b.copy()
         if self.num_envs == 1:
+            # Gymnasium expects obs, reward, terminated, truncated, info
             return observations_b[0], float(rewards_b[0]), terminated_b[0], truncated_b[0], infos_b[0]
         else:
+            # For batched envs not wrapped by SB3 VecEnv
             return observations_b, rewards_b, terminated_b, truncated_b, infos_b
 
     def render(self, mode='human'):
@@ -554,7 +621,10 @@ if __name__ == '__main__':
     try:
         render_mode_for_test = "human"  # User reverted to always try human rendering
         env = FrankaShelfEnv(num_envs=NUM_PARALLEL_ENVS_TO_TEST,
-                             render_mode=render_mode_for_test)
+                             render_mode=render_mode_for_test,
+                             k_collision_penalty=150.0,  # Example: Test with a specific collision penalty
+                             k_accel_penalty=0.001      # Example: Test with a small accel penalty
+                             )
         print("FrankaShelfEnv created successfully.")
         num_episodes_to_run = 2
         print(f"Running {num_episodes_to_run} example episodes...")
@@ -563,14 +633,17 @@ if __name__ == '__main__':
             print(
                 f"\n--- Starting Episode {episode_num + 1} (Batch of {env.num_envs} envs) ---")
             obs_batch, infos_batch = env.reset()
-            if env.num_envs == 1:
+            if env.num_envs == 1:  # Should not happen with NUM_PARALLEL_ENVS_TO_TEST = 4 but good for robustness
                 obs_batch = {key: val[np.newaxis, ...]
                              for key, val in obs_batch.items()}
+                # Ensure infos_batch is a list of dicts
                 infos_batch = [infos_batch]
             print(f"  Reset successful.")
             for i in range(env.num_envs):
+                current_info = infos_batch[i] if isinstance(
+                    infos_batch, list) and i < len(infos_batch) else {}
                 print(
-                    f"    Env {i}: Shelf Config: {infos_batch[i].get('shelf_config', env.current_shelf_config_key[i])}")
+                    f"    Env {i}: Shelf Config: {current_info.get('shelf_config', env.current_shelf_config_key[i])}")
                 print(
                     f"    Env {i}: Initial Relative Target (Obs): {obs_batch['relative_target_pos'][i]}")
                 print(
@@ -584,18 +657,22 @@ if __name__ == '__main__':
                     [env.action_space.sample() for _ in range(env.num_envs)])
                 obs_batch, rewards_batch, terminated_batch, truncated_batch, infos_batch = env.step(
                     actions_batch)
-                if env.num_envs == 1:
+                if env.num_envs == 1:  # Should not happen with NUM_PARALLEL_ENVS_TO_TEST = 4
                     obs_batch = {key: val[np.newaxis, ...]
                                  for key, val in obs_batch.items()}
                     rewards_batch = np.array([rewards_batch])
                     terminated_batch = np.array([terminated_batch])
                     truncated_batch = np.array([truncated_batch])
+                    # Ensure infos_batch is a list of dicts
                     infos_batch = [infos_batch]
+
                 if (step_num + 1) % 10 == 0:
                     print(f"  Step {step_num+1}:")
                     for i in range(env.num_envs):
+                        current_info = infos_batch[i] if isinstance(
+                            infos_batch, list) and i < len(infos_batch) else {}
                         print(
-                            f"    Env {i}: Dist={infos_batch[i].get('distance_to_target', -1):.2f}, Rew={rewards_batch[i]:.2f}, Term={terminated_batch[i]}, Trunc={truncated_batch[i]}")
+                            f"    Env {i}: Dist={current_info.get('distance_to_target', -1):.2f}, Rew={rewards_batch[i]:.2f}, Term={terminated_batch[i]}, Trunc={truncated_batch[i]}, Coll={current_info.get('collision_detected', False)}")
                 if np.all(np.logical_or(terminated_batch, truncated_batch)):
                     print(f"  All environments finished at step {step_num+1}.")
                     break

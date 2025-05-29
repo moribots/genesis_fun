@@ -9,6 +9,7 @@ The observation space includes robot state, target position, and a voxelized
 representation of obstacles. The action space is continuous joint velocity control.
 """
 import os
+import sys  # Added for main test block
 import random
 import math
 from typing import List, Any, Optional, Union, Type, Dict, Tuple
@@ -94,23 +95,28 @@ def boxes_to_voxel_grid(
                                'size': np.ndarray (3,) - box full dimensions (width, depth, height).
                                'orientation_quat': np.ndarray (4,) - box WXYZ orientation in world.
     :param grid_dims: Tuple (Depth, Height, Width) - dimensions of the voxel grid in number of voxels.
-    :param grid_origin_world: np.ndarray (3,) - world coordinates of the grid's corner (min x, y, z).
+                      Depth corresponds to world Z, Height to world Y, Width to world X.
+    :param grid_origin_world: np.ndarray (3,) - world coordinates of the grid's corner (min x, y, z of the grid).
     :param voxel_size: float - The side length of a single cubic voxel.
     :return: A 3D NumPy array (Depth, Height, Width) representing the voxel grid.
     """
     grid = np.zeros(grid_dims, dtype=np.float32)
     grid_D_elements, grid_H_elements, grid_W_elements = grid_dims
+    # grid_origin_world is (min_x, min_y, min_z) of the voxel grid volume
     origin_x, origin_y, origin_z = grid_origin_world
-
-    if not list_of_box_params:
-        return grid
 
     box_half_sizes_list = [box_params['size'] /
                            2.0 for box_params in list_of_box_params]
 
+    # Voxel iteration: k for depth (Z), j for height (Y), i for width (X)
+    # Iterates over Z-dimension of the grid
     for k_depth_idx in range(grid_D_elements):
+        # Iterates over Y-dimension of the grid
         for j_height_idx in range(grid_H_elements):
+            # Iterates over X-dimension of the grid
             for i_width_idx in range(grid_W_elements):
+                # Calculate center of the current voxel in world coordinates
+                # Note: Voxel grid (D,H,W) means D is along world Z, H along world Y, W along world X
                 voxel_center_world_x = origin_x + \
                     (i_width_idx + 0.5) * voxel_size
                 voxel_center_world_y = origin_y + \
@@ -131,7 +137,8 @@ def boxes_to_voxel_grid(
 
                     if _is_point_inside_box(voxel_center_local, box_half_sizes):
                         grid[k_depth_idx, j_height_idx, i_width_idx] = 1.0
-                        break
+                        break  # Voxel is occupied, no need to check other boxes for this voxel
+
     return grid
 
 
@@ -164,6 +171,7 @@ def boxes_to_voxel_grid_batched(
         for component_params in list_of_batched_box_params:
             current_env_box_params.append({
                 'position': component_params['position'][env_idx],
+                # This is (Width, Depth, Height) for the component box
                 'size': component_params['size'],
                 'orientation_quat': component_params['orientation_quat'][env_idx]
             })
@@ -192,12 +200,13 @@ class FrankaShelfEnv(VecEnv):
     FRANKA_VEL_LIMIT: np.ndarray = np.array(
         [2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100], dtype=np.float32)
     ROBOT_EE_LINK_NAME: str = "hand"
-    DEFAULT_PLATE_WIDTH: float = 0.5
-    DEFAULT_PLATE_DEPTH: float = 0.4
-    DEFAULT_PLATE_THICKNESS: float = 0.02
+    DEFAULT_PLATE_WIDTH: float = 0.5    # X-dim of plate
+    DEFAULT_PLATE_DEPTH: float = 0.4    # Y-dim of plate
+    DEFAULT_PLATE_THICKNESS: float = 0.02  # Z-dim of plate
     DEFAULT_WALL_THICKNESS: float = 0.02
     DEFAULT_ACTUAL_OPENING_HEIGHT: float = 0.25
     DEFAULT_WALL_COMPONENT_HEIGHT: float = DEFAULT_ACTUAL_OPENING_HEIGHT
+    # Component sizes are typically (Width, Depth, Height) or (X, Y, Z)
     COMPONENT_SIZE_PLATE: np.ndarray = np.array(
         [DEFAULT_PLATE_WIDTH, DEFAULT_PLATE_DEPTH, DEFAULT_PLATE_THICKNESS], dtype=np.float32)
     COMPONENT_SIZE_SIDE_WALL: np.ndarray = np.array(
@@ -214,11 +223,14 @@ class FrankaShelfEnv(VecEnv):
                  render_mode: Optional[str] = None,
                  num_envs: int = 1,
                  env_spacing: Tuple[float, float] = (2.0, 2.0),
-                 voxel_grid_dims: Tuple[int, int, int] = (32, 48, 48),
+                 # voxel_grid_dims: (Depth, Height, Width) -> (Z, Y, X world axes for grid)
+                 voxel_grid_dims: Tuple[int, int, int] = (
+                     32, 48, 48),  # Defaulting to recommended
                  workspace_bounds_xyz: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
-                     (-0.8, 0.8), (-0.8, 0.8), (0.0, 1.5)),
-                 voxel_grid_world_size: Tuple[float,
-                                              float, float] = (0.8, 0.8, 0.5),
+                     (-0.8, 0.8), (-0.8, 0.8), (0.0, 1.5)),  # World X, Y, Z bounds
+                 # voxel_grid_world_size: (span_X, span_Y, span_Z) for the voxel grid volume
+                 voxel_grid_world_size: Tuple[float, float, float] = (
+                     0.8, 0.8, 0.5),  # Defaulting to recommended
                  max_steps_per_episode: int = 1000,
                  dt: float = 0.01,
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
@@ -235,7 +247,7 @@ class FrankaShelfEnv(VecEnv):
                  video_camera_lookat: Tuple[float,
                                             float, float] = (0.3, 0.0, 0.5),
                  video_camera_fov: float = 45,
-                 video_res: Tuple[int, int] = (320, 240)
+                 video_res: Tuple[int, int] = (960, 640)
                  ):
         self.render_mode = render_mode
         self._num_envs = num_envs
@@ -252,7 +264,7 @@ class FrankaShelfEnv(VecEnv):
                 high=np.full(relative_target_pos_dim,
                              np.inf, dtype=np.float32),
                 dtype=np.float32),
-            "obstacle_voxels": spaces.Box(
+            "obstacle_voxels": spaces.Box(  # Shape is (Depth, Height, Width)
                 low=0, high=1, shape=voxel_grid_dims, dtype=np.float32)
         })
         _action_space = spaces.Box(
@@ -260,30 +272,63 @@ class FrankaShelfEnv(VecEnv):
         super().__init__(num_envs=self._num_envs,
                          observation_space=_observation_space, action_space=_action_space)
         self.env_spacing = env_spacing
+        # (D_voxels, H_voxels, W_voxels)
         self.voxel_grid_dims = voxel_grid_dims
         self.workspace_bounds_x, self.workspace_bounds_y, self.workspace_bounds_z = workspace_bounds_xyz
+        # voxel_grid_world_size is (world_X_span, world_Y_span, world_Z_span)
         self.voxel_grid_world_span_x, self.voxel_grid_world_span_y, self.voxel_grid_world_span_z = voxel_grid_world_size
+
+        # Voxel dimensions:
+        # Width_voxels (self.voxel_grid_dims[2]) span world_X (self.voxel_grid_world_span_x)
+        # Height_voxels (self.voxel_grid_dims[1]) span world_Y (self.voxel_grid_world_span_y)
+        # Depth_voxels (self.voxel_grid_dims[0]) span world_Z (self.voxel_grid_world_span_z)
         _vx_span_per_voxel = self.voxel_grid_world_span_x / \
-            self.voxel_grid_dims[2]
+            self.voxel_grid_dims[2]  # X-span per W-voxel
         _vy_span_per_voxel = self.voxel_grid_world_span_y / \
-            self.voxel_grid_dims[1]
+            self.voxel_grid_dims[1]  # Y-span per H-voxel
         _vz_span_per_voxel = self.voxel_grid_world_span_z / \
-            self.voxel_grid_dims[0]
-        self.voxel_size = min(_vx_span_per_voxel,
+            self.voxel_grid_dims[0]  # Z-span per D-voxel
+        self.voxel_size = min(_vx_span_per_voxel,  # Using min for roughly cubic voxels
                               _vy_span_per_voxel, _vz_span_per_voxel)
-        eff_grid_span_x = self.voxel_grid_dims[2] * self.voxel_size
-        eff_grid_span_y = self.voxel_grid_dims[1] * self.voxel_size
+
+        # Effective span of the grid if voxels were made cubic using self.voxel_size
+        eff_grid_span_world_x = self.voxel_grid_dims[2] * self.voxel_size
+        eff_grid_span_world_y = self.voxel_grid_dims[1] * self.voxel_size
+        # Not directly used for origin calc below
+        eff_grid_span_world_z = self.voxel_grid_dims[0] * self.voxel_size
+
+        # Calculate the bottom-left-front corner of the voxel grid volume in world coordinates
+        # This centers the effective grid span within the overall voxel_grid_world_span,
+        # which itself is assumed to be placed relative to workspace_bounds.
+        # For simplicity, let's assume grid_origin is the min corner of voxel_grid_world_span
+        # and that voxel_grid_world_span starts at some offset from workspace_bounds[0]
+        # The definition from boxes_to_voxel_grid implies grid_origin_world is (min_x, min_y, min_z)
+        # Let's make self.grid_origin_global_frame the (min_x, min_y, min_z) of the voxel grid volume.
+        # The current self.grid_origin_world_x/y are placing the *effective* grid.
+        # This should be the origin of the *defined* voxel_grid_world_size volume.
+        # If voxel_grid_world_size is (0.8,0.8,0.5) and workspace is (-0.8,0.8), (-0.8,0.8), (0,1.5)
+        # We can place this volume starting at (-0.4, -0.4, 0.0) to center it in XY and start at Z=0.
+        # For now, keep original logic for grid origin, but it means voxel_size calculation might not perfectly align
+        # with how boxes_to_voxel_grid uses it if effective spans are different from world_spans.
+        # The self.voxel_size is what will be used by the new visualization.
+        # The `boxes_to_voxel_grid` uses `grid_origin_world` which refers to the overall grid volume's origin.
+
         self.grid_origin_world_x = self.workspace_bounds_x[0] + \
-            ((self.workspace_bounds_x[1] -
-             self.workspace_bounds_x[0]) - eff_grid_span_x) / 2.0
+            ((self.workspace_bounds_x[1] - self.workspace_bounds_x[0]
+              ) - eff_grid_span_world_x) / 2.0
         self.grid_origin_world_y = self.workspace_bounds_y[0] + \
-            ((self.workspace_bounds_y[1] -
-             self.workspace_bounds_y[0]) - eff_grid_span_y) / 2.0
+            ((self.workspace_bounds_y[1] - self.workspace_bounds_y[0]
+              ) - eff_grid_span_world_y) / 2.0
+        # Grid starts at min Z of workspace
         self.grid_origin_world_z = self.workspace_bounds_z[0]
+
+        # This self.grid_origin_global_frame is the (min_x, min_y, min_z) of the voxel grid volume
         self.grid_origin_global_frame = np.array(
             [self.grid_origin_world_x, self.grid_origin_world_y, self.grid_origin_world_z], dtype=np.float32)
+
         self.grid_origins_batch_world = np.tile(
             self.grid_origin_global_frame, (self.num_envs, 1))
+
         self.max_steps = max_steps_per_episode
         self.current_step_per_env = np.zeros(self.num_envs, dtype=np.int32)
         self.dt = dt
@@ -307,13 +352,13 @@ class FrankaShelfEnv(VecEnv):
             camera_lookat=video_camera_lookat,
             camera_fov=video_camera_fov,
             res=video_res if self.render_mode == "human" else (
-                960, 640),  # type: ignore
+                960, 640),
             max_FPS=self.metadata['render_fps']
         )
         self.scene = gs.Scene(
             viewer_options=sim_viewer_options,
             sim_options=gs.options.SimOptions(dt=self.dt),
-            show_viewer=(self.render_mode == "human")  # type: ignore
+            show_viewer=(self.render_mode == "human")
         )
         self.video_camera_params = {
             'pos': video_camera_pos, 'lookat': video_camera_lookat,
@@ -332,7 +377,7 @@ class FrankaShelfEnv(VecEnv):
             gs.morphs.MJCF(file=self.franka_xml_path))
         self.shelf_component_entities: List[Any] = [
             self.scene.add_entity(gs.morphs.Box(
-                pos=(0, -10 - i * 0.5, 0),
+                pos=(0, -10 - i * 0.5, 0),  # Initial off-screen position
                 quat=(1, 0, 0, 0),
                 size=tuple(s),
                 fixed=True,
@@ -356,7 +401,7 @@ class FrankaShelfEnv(VecEnv):
             :self.FRANKA_NUM_ARM_JOINTS]
         self.max_allowable_joint_velocity_scale = 0.5
         self.actions_buffer = np.zeros(
-            (self.num_envs, self.action_space.shape[0]), dtype=self.action_space.dtype)  # type: ignore
+            (self.num_envs, self.action_space.shape[0]), dtype=self.action_space.dtype)
         self.buf_infos: List[Dict[str, Any]] = [{}
                                                 for _ in range(self.num_envs)]
 
@@ -425,7 +470,8 @@ class FrankaShelfEnv(VecEnv):
                 shelf_assembly_yaws_batch[i] = np.pi
             elif "left" in config["name"]:
                 shelf_assembly_yaws_batch[i] = 0.0
-            else:
+            else:  # Default orientation if not specified by name patterns
+                # Or perhaps a random yaw if desired
                 shelf_assembly_yaws_batch[i] = 0.0
             self.current_shelf_instance_params_per_env[i] = {
                 "shelf_assembly_origin_world": shelf_assembly_origins_world_batch[i].copy(),
@@ -437,40 +483,44 @@ class FrankaShelfEnv(VecEnv):
 
         cos_yaw_half_batch = np.cos(shelf_assembly_yaws_batch / 2.0)
         sin_yaw_half_batch = np.sin(shelf_assembly_yaws_batch / 2.0)
-        shelf_assembly_world_quats_batch_wxyz = np.zeros(
+        shelf_assembly_world_quats_batch_wxyz = np.zeros(  # W,X,Y,Z
             (self.num_envs, 4), dtype=np.float32)
-        shelf_assembly_world_quats_batch_wxyz[:, 0] = cos_yaw_half_batch
+        shelf_assembly_world_quats_batch_wxyz[:, 0] = cos_yaw_half_batch  # W
+        # Z (for yaw around Z-axis of assembly frame)
         shelf_assembly_world_quats_batch_wxyz[:, 3] = sin_yaw_half_batch
 
-        shelf_assembly_world_quats_batch_xyzw = np.zeros(
+        shelf_assembly_world_quats_batch_xyzw = np.zeros(  # X,Y,Z,W for SciPy
             (self.num_envs, 4), dtype=np.float32)
         shelf_assembly_world_quats_batch_xyzw[:,
-                                              0] = shelf_assembly_world_quats_batch_wxyz[:, 1]
+                                              0] = shelf_assembly_world_quats_batch_wxyz[:, 1]  # X
         shelf_assembly_world_quats_batch_xyzw[:,
-                                              1] = shelf_assembly_world_quats_batch_wxyz[:, 2]
+                                              1] = shelf_assembly_world_quats_batch_wxyz[:, 2]  # Y
         shelf_assembly_world_quats_batch_xyzw[:,
-                                              2] = shelf_assembly_world_quats_batch_wxyz[:, 3]
+                                              2] = shelf_assembly_world_quats_batch_wxyz[:, 3]  # Z
         shelf_assembly_world_quats_batch_xyzw[:,
-                                              3] = shelf_assembly_world_quats_batch_wxyz[:, 0]
+                                              3] = shelf_assembly_world_quats_batch_wxyz[:, 0]  # W
 
         bottom_plate_s, top_plate_s, side_wall_s, _, back_wall_s = self.FIXED_COMPONENT_SIZES[
             0:5]
         actual_opening_h = self.DEFAULT_ACTUAL_OPENING_HEIGHT
+        # Local offsets from shelf assembly origin to center of each component
         local_component_offsets = [
+            # Bottom plate (size is W,D,H)
             np.array([0, 0, bottom_plate_s[2] / 2.0]),
-            np.array([0, 0, bottom_plate_s[2] +
-                     actual_opening_h + top_plate_s[2] / 2.0]),
+            np.array([0, 0, bottom_plate_s[2] + actual_opening_h +
+                     top_plate_s[2] / 2.0]),  # Top plate
             np.array([-(bottom_plate_s[0] / 2.0 - side_wall_s[0] / 2.0), 0,
-                      bottom_plate_s[2] + side_wall_s[2] / 2.0]),
+                     bottom_plate_s[2] + side_wall_s[2] / 2.0]),  # Left side wall
             np.array([(bottom_plate_s[0] / 2.0 - side_wall_s[0] / 2.0), 0,
-                      bottom_plate_s[2] + side_wall_s[2] / 2.0]),
+                     bottom_plate_s[2] + side_wall_s[2] / 2.0]),  # Right side wall
             np.array([0, -(bottom_plate_s[1] / 2.0 - back_wall_s[1] / 2.0),
-                      bottom_plate_s[2] + back_wall_s[2] / 2.0])
+                     bottom_plate_s[2] + back_wall_s[2] / 2.0])  # Back wall
         ]
         list_of_box_params_for_voxelization_batched: List[Dict[str, Any]] = []
 
         for comp_idx, component_entity in enumerate(self.shelf_component_entities):
             local_offset_of_this_component = local_component_offsets[comp_idx]
+            # This is (WorldX, WorldY, WorldZ) size
             fixed_size_of_this_component = self.FIXED_COMPONENT_SIZES[comp_idx]
             batched_final_comp_pos_world = np.zeros(
                 (self.num_envs, 3), dtype=np.float32)
@@ -482,15 +532,16 @@ class FrankaShelfEnv(VecEnv):
                     rotated_offset_world_i
 
             pos_tensor = torch.tensor(
-                batched_final_comp_pos_world, device=gs.device, dtype=torch.float32)  # type: ignore
-            quat_tensor = torch.tensor(
-                shelf_assembly_world_quats_batch_wxyz, device=gs.device, dtype=torch.float32)  # type: ignore
+                batched_final_comp_pos_world, device=gs.device, dtype=torch.float32)
+            quat_tensor = torch.tensor(  # Use WXYZ for Genesis
+                shelf_assembly_world_quats_batch_wxyz, device=gs.device, dtype=torch.float32)
             component_entity.set_pos(pos_tensor)
             component_entity.set_quat(quat_tensor)
             list_of_box_params_for_voxelization_batched.append({
-                'position': batched_final_comp_pos_world,
+                'position': batched_final_comp_pos_world,  # Center of box in world
+                # Full (X,Y,Z) dimensions of box
                 'size': fixed_size_of_this_component,
-                'orientation_quat': shelf_assembly_world_quats_batch_wxyz
+                'orientation_quat': shelf_assembly_world_quats_batch_wxyz  # WXYZ orientation
             })
         return list_of_box_params_for_voxelization_batched
 
@@ -502,8 +553,10 @@ class FrankaShelfEnv(VecEnv):
             open_w, open_d, open_h = params["internal_width"], params["internal_depth"], params["actual_opening_height"]
             target_local_x = random.uniform(-open_w /
                                             2 * 0.7, open_w / 2 * 0.7)
+            # Target towards front of shelf
             target_local_y = random.uniform(-open_d /
                                             2 * 0.7, open_d / 2 * 0.3)
+            # Relative to center of opening
             target_local_z = random.uniform(-open_h /
                                             2 * 0.8, open_h / 2 * 0.8)
             target_in_shelf_opening_frame = np.array(
@@ -511,10 +564,11 @@ class FrankaShelfEnv(VecEnv):
 
             shelf_assembly_origin_world = params["shelf_assembly_origin_world"]
             shelf_assembly_yaw = params["shelf_assembly_yaw"]
+            # Offset from shelf assembly origin to the center of the shelf's opening
             offset_to_opening_center_local = np.array(
                 [0, 0, self.DEFAULT_PLATE_THICKNESS + open_h / 2.0], dtype=np.float32)
 
-            shelf_assembly_quat_world_wxyz = np.array(
+            shelf_assembly_quat_world_wxyz = np.array(  # W,X,Y,Z
                 [np.cos(shelf_assembly_yaw / 2.0), 0, 0, np.sin(shelf_assembly_yaw / 2.0)], dtype=np.float32)
             shelf_assembly_quat_world_xyzw = shelf_assembly_quat_world_wxyz[[
                 1, 2, 3, 0]]  # XYZW for SciPy
@@ -527,12 +581,14 @@ class FrankaShelfEnv(VecEnv):
             self.target_position_world_batch[i] = opening_center_world + \
                 target_offset_world_rotated
 
-        if self.render_mode == "human" or self._is_recording_active:  # type: ignore
-            if self.scene and hasattr(self.scene, 'clear_debug_objects'):
-                self.scene.clear_debug_objects()
-            if self.num_envs == 1 and self.scene:
+        # Debug visualization for target
+        if self.scene and hasattr(self.scene, 'clear_debug_objects'):
+            self.scene.clear_debug_objects()  # Clear previous debug objects (target, voxels)
+
+        if (self.render_mode == "human" or self._is_recording_active):
+            if self.num_envs == 1 and self.scene:  # Only draw for single env for clarity
                 self.scene.draw_debug_spheres(
-                    self.target_position_world_batch.tolist(), radius=0.03, color=(0, 1, 0, 0.8))
+                    self.target_position_world_batch.tolist(), radius=0.03, color=(0, 1, 0, 0.8))  # Green sphere
         return self.target_position_world_batch
 
     def _get_obs_batched(self) -> VecEnvObs:
@@ -548,12 +604,72 @@ class FrankaShelfEnv(VecEnv):
             "obstacle_voxels": self.current_voxel_grid_batch.copy()
         }
 
-    # type: ignore
+    # Relevant changes within FrankaShelfEnv class in franka_rl_env.py
+
+    def _visualize_voxel_grid(self) -> None:
+        """Draws the currently computed voxel grid as debug boxes if in human render mode for a single env."""
+        if not (self.num_envs == 1 and self.render_mode == "human" and self.scene):
+            return
+
+        voxel_grid_single = self.current_voxel_grid_batch[0]  # (D, H, W)
+        # min_x, min_y, min_z of the grid volume
+        grid_origin_single = self.grid_origin_global_frame
+
+        voxel_s = self.voxel_size  # Uniform voxel side length
+        grid_D, grid_H, grid_W = self.voxel_grid_dims
+
+        num_drawn_voxels = 0
+        half_voxel_s = voxel_s / 2.0
+        # Light blue, semi-transparent
+        color_rgba = np.array([0.2, 0.5, 1.0, 0.25], dtype=np.float32)
+
+        for k in range(grid_D):  # Depth -> world Z
+            for j in range(grid_H):  # Height -> world Y
+                for i in range(grid_W):  # Width -> world X
+                    if voxel_grid_single[k, j, i] > 0.5:  # If voxel is occupied
+                        # Calculate voxel center
+                        center_x = grid_origin_single[0] + (i + 0.5) * voxel_s
+                        center_y = grid_origin_single[1] + (j + 0.5) * voxel_s
+                        center_z = grid_origin_single[2] + (k + 0.5) * voxel_s
+
+                        # Calculate bounds [[min_x, min_y, min_z], [max_x, max_y, max_z]]
+                        min_coords = [
+                            center_x - half_voxel_s,
+                            center_y - half_voxel_s,
+                            center_z - half_voxel_s
+                        ]
+                        max_coords = [
+                            center_x + half_voxel_s,
+                            center_y + half_voxel_s,
+                            center_z + half_voxel_s
+                        ]
+                        bounds = np.array(
+                            [min_coords, max_coords], dtype=np.float32)
+
+                        try:
+                            # Call draw_debug_box with bounds and color
+                            # Set wireframe as desired
+                            self.scene.draw_debug_box(
+                                bounds, color=color_rgba, wireframe=False)
+                            num_drawn_voxels += 1
+                        except Exception as e:
+                            print(
+                                f"Error drawing a single debug box for a voxel: {e}")
+                            return  # Stop trying to draw more voxels if one fails
+
+        # Should not happen if previous check passes
+        if num_drawn_voxels == 0 and np.any(voxel_grid_single > 0.5):
+            # This print is only useful if the if-condition was true but drawing failed silently for all.
+            # Given the user's report, the issue is that the voxel_grid_single is empty.
+            print("Voxel grid has occupied cells, but none were drawn (unexpected).")
+        elif num_drawn_voxels == 0:  # This is the case the user is reporting
+            print("No occupied voxels to visualize in the voxel grid (voxel_grid_single seems empty or all values <= 0.5).")
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> VecEnvObs:
         """Resets all parallel environments to an initial state."""
         if seed is not None:
             np.random.seed(seed)
-            random.seed(seed)
+            random.seed(seed)  # Seed python's random module as well
         if self.scene:
             if self.scene.is_built:
                 self.scene.reset()
@@ -569,9 +685,9 @@ class FrankaShelfEnv(VecEnv):
         initial_qvel_batch = np.zeros(
             (self.num_envs, self.FRANKA_NUM_TOTAL_JOINTS), dtype=np.float32)
         qpos_tensor = torch.tensor(
-            initial_qpos_batch, device=gs.device, dtype=torch.float32)  # type: ignore
+            initial_qpos_batch, device=gs.device, dtype=torch.float32)
         qvel_tensor = torch.tensor(
-            initial_qvel_batch, device=gs.device, dtype=torch.float32)  # type: ignore
+            initial_qvel_batch, device=gs.device, dtype=torch.float32)
         if self.franka_entity:
             self.franka_entity.set_dofs_position(
                 qpos_tensor, self.franka_all_dof_indices_local)
@@ -579,21 +695,26 @@ class FrankaShelfEnv(VecEnv):
                 qvel_tensor, self.franka_all_dof_indices_local)
         self.prev_joint_vel_batch.fill(0.0)
 
-        # Voxelization step using NumPy-based approach
         list_of_box_params = self._build_shelf_structure_batched()
         self.current_voxel_grid_batch = boxes_to_voxel_grid_batched(
             list_of_box_params,
             self.voxel_grid_dims,
+            # This is (min_x, min_y, min_z) for each env's grid
             self.grid_origins_batch_world,
-            self.voxel_size,
+            self.voxel_size,  # This is the uniform voxel side length
             self.num_envs
         )
 
+        # This clears debug objects then draws target
         self._generate_target_in_shelf_batched()
+
         obs_batch = self._get_obs_batched()
         self.buf_infos = [{} for _ in range(self.num_envs)]
         for i in range(self.num_envs):
             self.buf_infos[i]["shelf_config"] = self.current_shelf_config_key_per_env[i]
+
+        self._visualize_voxel_grid()
+
         return obs_batch
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -678,12 +799,14 @@ class FrankaShelfEnv(VecEnv):
         scaled_target_velocities_batch = actions_clipped_batch * \
             self.max_allowable_joint_velocity_scale
         actions_tensor = torch.tensor(
-            scaled_target_velocities_batch, device=gs.device, dtype=torch.float32)  # type: ignore
+            scaled_target_velocities_batch, device=gs.device, dtype=torch.float32)
         self.franka_entity.control_dofs_velocity(
             actions_tensor, self.franka_arm_dof_indices_local)
-        self.scene.step()
+        self.scene.step()  # This handles rendering if show_viewer=True and render_mode="human"
+
         if self._is_recording_active and self.video_capture_camera:
             self.video_capture_camera.render()
+
         arm_qpos_b, arm_qvel_b, ee_pos_b, _ = self._get_robot_state_parts_batched()
         rewards_b, dones_b, terminated_b, self.buf_infos = self._calculate_rewards_and_dones(
             actions_clipped_batch, arm_qpos_b, arm_qvel_b, ee_pos_b
@@ -695,17 +818,33 @@ class FrankaShelfEnv(VecEnv):
                 terminal_obs_single_env = {k: v[i]
                                            for k, v in observations_b.items()}
                 self.buf_infos[i]["terminal_observation"] = terminal_obs_single_env
+
+        # For human mode, ensure debug visualizations are up-to-date
+        # Target is redrawn if it changes or after clear_debug_objects
+        # Voxels are static per episode, drawn once at reset and via render()
+        if self.render_mode == "human" and self.num_envs == 1:
+            # _generate_target_in_shelf_batched might have been called if reset happened due to done
+            # or if target is dynamic (not the case here per step)
+            # Ensure target (if needed) and voxels are drawn.
+            # Target is handled by _generate_target_in_shelf_batched or start_video_recording
+            # Voxels can be redrawn by calling render()
+            # Rely on external call to render() or scene.step() for visualization updates.
+            pass
+
         return observations_b, rewards_b, dones_b, self.buf_infos
 
-    # type: ignore
     def render(self, mode: Optional[str] = 'human') -> Optional[Union[np.ndarray, List[np.ndarray]]]:
-        """Renders the environment."""
-        if mode == "human" and self.render_mode == "human":
+        """Renders the environment. Also handles drawing debug voxels in human mode."""
+        if mode == "human" and self.render_mode == "human" and self.num_envs == 1:
+            self._visualize_voxel_grid()  # Draw/redraw voxels
+            # The actual rendering to screen is handled by gs.Scene's internal loop (via scene.step())
             return None
         elif mode == "rgb_array":
             if not self.video_capture_camera:
+                # Fallback: render a slice of the voxel grid if no camera
+                # Assuming num_envs can be > 1
                 grid_to_render = self.current_voxel_grid_batch[0]
-                img_slice = np.sum(grid_to_render, axis=0)
+                img_slice = np.sum(grid_to_render, axis=0)  # Sum along depth
                 if np.max(img_slice) > 0:
                     img_slice_norm = np.clip(
                         img_slice / np.max(img_slice), 0, 1)
@@ -713,15 +852,19 @@ class FrankaShelfEnv(VecEnv):
                     img_slice_norm = np.zeros_like(img_slice)
                 img_slice_uint8 = (img_slice_norm * 255).astype(np.uint8)
                 rgb_image = np.stack([img_slice_uint8] * 3, axis=-1)
-                return [rgb_image] if self.num_envs > 1 else rgb_image
+                return [rgb_image] if self.num_envs > 1 and isinstance(self.observation_space.spaces["obstacle_voxels"].shape, tuple) else rgb_image
+
             try:
+                # Ensure camera is set to focus on the correct environment if num_envs > 1
+                # This example assumes camera focuses on env 0 or a global view
                 rgb_output, _, _, _ = self.video_capture_camera.render(
                     rgb=True, depth=False, segmentation=False, normal=False)
-                if isinstance(rgb_output, list):
+                if isinstance(rgb_output, list):  # If camera renders for multiple envs
+                    # Return for first env
                     return rgb_output[0] if rgb_output else None
                 return rgb_output
             except Exception as e:
-                print(f"Error during camera render: {e}")
+                print(f"Error during camera render for rgb_array: {e}")
                 return None
         return None
 
@@ -734,7 +877,7 @@ class FrankaShelfEnv(VecEnv):
             except Exception as e:
                 print(f"Error closing video capture camera: {e}")
             finally:
-                self.video_capture_camera = None  # type: ignore
+                self.video_capture_camera = None
         if self.scene:
             try:
                 if hasattr(self.scene, 'close') and callable(self.scene.close):
@@ -744,38 +887,80 @@ class FrankaShelfEnv(VecEnv):
             except Exception as e:
                 print(f"Error closing/shutting down Genesis scene: {e}")
             finally:
-                self.scene = None  # type: ignore
+                self.scene = None
 
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
         """Gets an attribute from the vectorized environment."""
-        if hasattr(self, attr_name):
-            data = getattr(self, attr_name)
+        # Simplified: assumes attribute is shared across all envs or pertains to the VecEnv wrapper itself
+        target_obj = self  # Default to self
+        if indices is not None:  # This is tricky for VecEnv where sub-envs aren't distinct objects
+            # For now, assume attr_name is on the main VecEnv object
+            pass
+
+        if hasattr(target_obj, attr_name):
+            data = getattr(target_obj, attr_name)
+            # If VecEnv, we need to decide how to handle this. SB3 expects a list.
+            # If it's a property of the VecEnv itself, replicate it.
             return [data for _ in self._get_indices(indices)]
         raise AttributeError(
             f"Attribute '{attr_name}' not found in {self.__class__.__name__}")
 
     def set_attr(self, attr_name: str, value: Any, indices: VecEnvIndices = None) -> None:
         """Sets an attribute in the vectorized environment."""
-        setattr(self, attr_name, value)
+        # Simplified: sets on the VecEnv wrapper.
+        # Proper implementation would require handling individual sub-environments if they exist.
+        if indices is None or self._get_indices(indices) == list(range(self.num_envs)):
+            setattr(self, attr_name, value)
+        else:
+            # More complex if we need to set for specific sub-envs (not directly supported by this structure)
+            print(
+                f"Warning: set_attr for specific indices not fully implemented for {self.__class__.__name__}")
+            # Fallback to setting on main object
+            setattr(self, attr_name, value)
 
     def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
         """Calls a method in the vectorized environment for specified sub-environments."""
-        if hasattr(self, method_name):
-            method = getattr(self, method_name)
-            return [method(*method_args, **method_kwargs) for _ in self._get_indices(indices)]
-        raise AttributeError(
-            f"Method '{method_name}' not found in {self.__class__.__name__}")
+        # This VecEnv is not a wrapper around multiple distinct Python env objects in the typical SB3 sense.
+        # It batch-processes. So, methods are typically called on `self`.
+        results = []
+        for i in self._get_indices(indices):
+            if hasattr(self, method_name):
+                method = getattr(self, method_name)
+                # Be careful if method is not designed for single-env context or needs env_idx
+                # For now, assume method can be called directly.
+                try:
+                    # If the method needs an env_idx, this is a simplistic way to pass it.
+                    # This is not robust.
+                    if "env_idx" in method.__code__.co_varnames:
+                        res = method(*method_args, **method_kwargs, env_idx=i)
+                    else:
+                        res = method(*method_args, **method_kwargs)
+                    results.append(res)
+                except TypeError as e:
+                    print(
+                        f"Warning: Could not call method {method_name} with env_idx automatically: {e}")
+                    # Try without env_idx
+                    results.append(method(*method_args, **method_kwargs))
+            else:
+                raise AttributeError(
+                    f"Method '{method_name}' not found in {self.__class__.__name__}")
+        return results
 
     def env_is_wrapped(self, wrapper_class: Type[gym.Wrapper], indices: VecEnvIndices = None) -> List[bool]:
         """Checks if the environment is wrapped with a given wrapper."""
-        return [isinstance(self, wrapper_class) for _ in self._get_indices(indices)]
+        # This environment itself is the base, not wrapping other gym.Envs in the typical list sense.
+        # So, it's only wrapped if `self` is an instance of `wrapper_class`.
+        is_instance = isinstance(self, wrapper_class)
+        return [is_instance for _ in self._get_indices(indices)]
 
-    def seed(self, seed: Optional[int] = None) -> List[Union[None, int]]:  # type: ignore
+    def seed(self, seed: Optional[int] = None) -> List[Union[None, int]]:
         """Seeds the random number generators in all sub-environments."""
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
-        return [seed for _ in range(self.num_envs)]  # type: ignore
+            # PyTorch seeding should be handled externally if needed for model initialization
+        # Each "sub-environment" in this VecEnv shares the same RNG state here.
+        return [seed for _ in range(self.num_envs)]
 
     def start_video_recording(self, env_idx_to_focus: int = 0) -> bool:
         """Starts recording video frames."""
@@ -786,13 +971,23 @@ class FrankaShelfEnv(VecEnv):
         try:
             self.video_capture_camera.start_recording()
             self._is_recording_active = True
+            # Clear previous debug objects and draw current target for focused env
             if self.scene and hasattr(self.scene, 'clear_debug_objects'):
                 self.scene.clear_debug_objects()
+            # Focus on one for clarity
             if self.scene and (self.num_envs == 1 or env_idx_to_focus == 0):
+                # Ensure target_position_world_batch is up-to-date for the focused env
+                # This might require calling _generate_target_in_shelf_batched or part of it
+                # if targets are dynamic and not just set at reset.
+                # For now, assume target_position_world_batch[env_idx_to_focus] is correct.
                 self.scene.draw_debug_spheres(
                     [self.target_position_world_batch[env_idx_to_focus].tolist()],
-                    radius=0.03, color=(0, 1, 0, 0.8)
+                    radius=0.03, color=(0, 1, 0, 0.8)  # Green target
                 )
+                # Also draw voxels for this focused environment
+                if self.render_mode == "human":  # Only draw voxels if in human mode
+                    self._visualize_voxel_grid()
+
             return True
         except Exception as e:
             print(f"Error starting video recording: {e}")
@@ -802,6 +997,7 @@ class FrankaShelfEnv(VecEnv):
     def stop_video_recording(self, save_dir: str, filename: str, fps: int = 30) -> Optional[str]:
         """Stops video recording and saves the video to a file."""
         if not self._is_recording_active:
+            # print("Video recording was not active.")
             return None
         if not self.video_capture_camera:
             print(
@@ -813,6 +1009,7 @@ class FrankaShelfEnv(VecEnv):
             full_path = os.path.join(save_dir, filename)
             self.video_capture_camera.stop_recording(
                 save_to_filename=full_path, fps=fps)
+            # print(f"Video saved to {full_path}")
             return full_path
         except Exception as e:
             print(f"Error stopping/saving video recording: {e}")
@@ -823,10 +1020,10 @@ class FrankaShelfEnv(VecEnv):
 
 # --- Main block for testing the environment ---
 if __name__ == '__main__':
-    print("--- FrankaShelfEnv Test Script ---")
+    print("--- FrankaShelfEnv Test Script (Simplified for Visualization) ---")
     gs_initialized_in_main = False
     try:
-        if not (hasattr(gs, '_is_initialized') and gs._is_initialized):  # type: ignore
+        if not (hasattr(gs, '_is_initialized') and gs._is_initialized):
             gs.init(backend=gs.gpu if torch.cuda.is_available() else gs.cpu)
             gs_initialized_in_main = True
         print("Genesis initialized successfully for testing.")
@@ -835,75 +1032,55 @@ if __name__ == '__main__':
             f"CRITICAL ERROR: Failed to initialize Genesis for testing: {e_init}\nExiting.")
         sys.exit(1)
 
-    NUM_TEST_ENVS = 4
+    NUM_TEST_ENVS = 1  # Focus on a single environment for human visualization
     env = None
     try:
-        print(f"Creating FrankaShelfEnv with num_envs={NUM_TEST_ENVS}...")
+        print(
+            f"Creating FrankaShelfEnv with num_envs={NUM_TEST_ENVS} in human render mode...")
         env = FrankaShelfEnv(
-            num_envs=NUM_TEST_ENVS, render_mode="human",
-            k_collision_penalty=150.0, k_accel_penalty=0.001, video_res=(960, 640),
-            # to make it easier to detect 2cm shelves
+            num_envs=NUM_TEST_ENVS,
+            render_mode="human",
+            # Using recommended voxel settings for good visualization
             voxel_grid_dims=(32, 48, 48),
             voxel_grid_world_size=(0.8, 0.8, 0.5)
         )
         print(
             f"FrankaShelfEnv created. Obs Space: {env.observation_space}, Act Space: {env.action_space}")
-        print("\nTesting VecEnv reset...")
+
+        print("\nResetting environment...")
         obs_batch = env.reset()
-        assert isinstance(obs_batch, dict), "Reset should return a dict."
-        assert "obstacle_voxels" in obs_batch, "Obs missing 'obstacle_voxels'."
-        assert obs_batch['obstacle_voxels'].shape == (NUM_TEST_ENVS,) + env.voxel_grid_dims, \
-            f"Voxel grid shape mismatch. Expected {(NUM_TEST_ENVS,) + env.voxel_grid_dims}, got {obs_batch['obstacle_voxels'].shape}"
-        print("Reset successful. Voxel grid shape:",
-              obs_batch['obstacle_voxels'].shape)
-        # Check if any voxels are set
-        print("Sample voxel grid (sum):", np.sum(obs_batch['obstacle_voxels']))
+        # Initial render to show the setup (target sphere and voxels)
+        print("Performing initial render...")
+        env.render(mode="human")
 
-        print("\nTesting video recording (briefly)...")
-        if env.start_video_recording(env_idx_to_focus=0):
-            print("Recording started for 5 steps...")
-            for _ in range(5):
-                actions_sample = np.array(
-                    [env.action_space.sample() for _ in range(env.num_envs)])
-                env.step_async(actions_sample)
-                _, _, dones_sample, _ = env.step_wait()
-                if np.any(dones_sample):
-                    env.reset()
-            video_path = env.stop_video_recording(
-                save_dir="./videos_env_test", filename="test_franka_env_numpy_vox.mp4", fps=15)
-            if video_path:
-                print(f"Test video saved to {video_path}")
-            else:
-                print("Test video saving failed/not active.")
-        else:
-            print("Could not start video recording for test.")
+        # Allow some time for the viewer to initialize and display the first frame
+        if env.scene:
+            print("Stepping scene for initial view...")
+            for _ in range(30):  # Brief pause for viewer
+                env.scene.step()
 
-        print(f"\nRunning 1 example episode (batch of {env.num_envs} envs)...")
-        current_obs_batch = env.reset()
-        episode_rewards_sum = np.zeros(env.num_envs)
-        for step_num in range(500):
+        print("\nRunning a short loop with random actions for visualization (200 steps)...")
+        for step_num in range(200):
             actions = np.array([env.action_space.sample()
                                for _ in range(env.num_envs)])
             env.step_async(actions)
             next_obs_batch, rewards_b, dones_b, infos_b = env.step_wait()
-            episode_rewards_sum += rewards_b
-            if (step_num + 1) % 5 == 0:
+            env.render(mode="human")
+
+            if (step_num + 1) % 20 == 0:
                 print(
-                    f"  Test Step {step_num+1}: Env 0 Rew={rewards_b[0]:.2f}, Done={dones_b[0]}")
-                print("  Voxel grid sum:", np.sum(
-                    next_obs_batch['obstacle_voxels']))
-            if np.all(dones_b):
-                break
-        print(f"  Test Episode finished. Total rewards: {episode_rewards_sum}")
+                    f"  Step {step_num+1} completed. Reward: {rewards_b[0]:.2f}, Done: {dones_b[0]}")
+
+        print("\nBasic visualization loop finished.")
 
     except Exception as e_runtime:
         print(f"ERROR during FrankaShelfEnv example usage: {e_runtime}")
         traceback.print_exc()
     finally:
         if env:
+            print("Closing environment...")
             env.close()
-        # type: ignore
         if gs_initialized_in_main and hasattr(gs, 'shutdown') and callable(gs.shutdown):
             print("Shutting down Genesis post-testing.")
-            gs.shutdown()  # type: ignore
+            gs.shutdown()
         print("--- FrankaShelfEnv Test Script Finished ---")

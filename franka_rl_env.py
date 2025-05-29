@@ -214,11 +214,11 @@ class FrankaShelfEnv(VecEnv):
                  render_mode: Optional[str] = None,
                  num_envs: int = 1,
                  env_spacing: Tuple[float, float] = (2.0, 2.0),
-                 voxel_grid_dims: Tuple[int, int, int] = (16, 16, 16),
+                 voxel_grid_dims: Tuple[int, int, int] = (32, 48, 48),
                  workspace_bounds_xyz: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
                      (-0.8, 0.8), (-0.8, 0.8), (0.0, 1.5)),
                  voxel_grid_world_size: Tuple[float,
-                                              float, float] = (1.6, 1.6, 1.0),
+                                              float, float] = (0.8, 0.8, 0.5),
                  max_steps_per_episode: int = 1000,
                  dt: float = 0.01,
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
@@ -842,7 +842,8 @@ if __name__ == '__main__':
         env = FrankaShelfEnv(
             num_envs=NUM_TEST_ENVS, render_mode="human",
             k_collision_penalty=150.0, k_accel_penalty=0.001, video_res=(960, 640),
-            voxel_grid_dims=(8, 8, 8),
+            # to make it easier to detect 2cm shelves
+            voxel_grid_dims=(32, 48, 48),
             voxel_grid_world_size=(0.8, 0.8, 0.5)
         )
         print(

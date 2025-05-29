@@ -233,6 +233,8 @@ def create_env_config(training_config: Dict[str, Any]) -> Dict[str, Any]:
     return dict(
         render_mode=None,  # Typically None for training, can be 'human' for debugging
         num_envs=training_config["num_genesis_envs"],
+        voxel_grid_dims=training_config["voxel_grid_dims_override"],
+        voxel_grid_world_size=training_config["voxel_grid_world_size_override"],
         k_dist_reward=training_config.get('k_dist_reward'),
         k_time_penalty=training_config.get('k_time_penalty'),
         k_action_penalty=training_config.get('k_action_penalty'),
@@ -613,6 +615,8 @@ if __name__ == '__main__':
         "cnn_features_dim": 256,
         "total_timesteps": 15_000_000,
         "num_genesis_envs": 1024,
+        "voxel_grid_world_size_override": (0.8, 0.8, 0.5),
+        "voxel_grid_dims_override": (32, 48, 48),
         "log_dir": "./training_logs/ppo_franka_shelf_refactored/",
         "model_save_path": "./training_logs/ppo_franka_shelf_refactored/model_refactored",
         "wandb_project_name": "FrankaShelfPPO-Refactored",

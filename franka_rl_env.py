@@ -85,7 +85,7 @@ class FrankaShelfEnv(VecEnv):
     def __init__(self,
                  render_mode: Optional[str] = None,
                  num_envs: int = 1,
-                 env_spacing: Tuple[float, float] = (2.0, 2.0),
+                 env_spacing: Tuple[float, float] = (1.5, 1.5),
                  workspace_bounds_xyz: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
                      (-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
                  max_steps_per_episode: int = 1000,
@@ -100,13 +100,13 @@ class FrankaShelfEnv(VecEnv):
                  video_camera_lookat: Tuple[float,
                                             float, float] = (0.3, 0.0, 0.5),
                  video_camera_fov: float = 45, video_res: Tuple[int, int] = (960, 640),
-                 include_shelf: bool = True,  # MOD: Added
-                 randomize_shelf_config: bool = True  # MOD: Added
+                 include_shelf: bool = True,
+                 randomize_shelf_config: bool = True
                  ):
         self.render_mode = render_mode
         self._num_envs = num_envs
-        self.include_shelf = include_shelf  # MOD: Added
-        self.randomize_shelf_config = randomize_shelf_config  # MOD: Added
+        self.include_shelf = include_shelf
+        self.randomize_shelf_config = randomize_shelf_config
 
         robot_state_flat_dim = self.FRANKA_NUM_ARM_JOINTS * 2 + 3 + 4
         relative_target_pos_dim = 3
@@ -143,7 +143,7 @@ class FrankaShelfEnv(VecEnv):
         self.metadata = {'render_modes': [
             'human', 'rgb_array', 'video'], 'render_fps': 60}
         sim_viewer_options = gs.options.ViewerOptions(camera_pos=video_camera_pos, camera_lookat=video_camera_lookat, camera_fov=video_camera_fov,
-                                                      res=video_res if self.render_mode == "human" else (960, 640), max_FPS=self.metadata['render_fps'])
+                                                      res=video_res, max_FPS=self.metadata['render_fps'])
         self.scene = gs.Scene(viewer_options=sim_viewer_options, sim_options=gs.options.SimOptions(
             dt=self.dt), show_viewer=(self.render_mode == "human"))
         self.video_camera_params = {
@@ -155,11 +155,22 @@ class FrankaShelfEnv(VecEnv):
         self.franka_entity = self.scene.add_entity(
             gs.morphs.MJCF(file=self.franka_xml_path))
 
-        # MOD: Initialize as empty
         self.shelf_component_entities: List[Any] = []
-        if self.include_shelf:  # MOD: Conditionally create shelf entities
+        if self.include_shelf:
             self.shelf_component_entities = [self.scene.add_entity(gs.morphs.Box(pos=(0, -10 - i * 0.5, 0), quat=(
                 1, 0, 0, 0), size=tuple(s), fixed=True, collision=True, visualization=True)) for i, s in enumerate(self.FIXED_COMPONENT_SIZES)]
+
+        self.target_sphere_entity_type: Optional[Any] = None
+        if self.scene and self._num_envs > 1:
+            self.target_sphere_entity_type = self.scene.add_entity(
+                gs.morphs.Sphere(
+                    pos=(0, -20, 0),
+                    radius=0.03,
+                    visualization=True,
+                    collision=False,
+                    fixed=True
+                )
+            )
 
         if not self.scene.is_built:
             self.scene.build(n_envs=self.num_envs,
@@ -183,7 +194,6 @@ class FrankaShelfEnv(VecEnv):
 
     def _define_shelf_configurations(self) -> None:
         self.shelf_configurations: Dict[str, Dict[str, Any]] = {
-            # MOD: Added default
             "default_center_reach": {"name": "default_center_reach", "base_pos_range_x": (0.55, 0.55), "base_pos_range_y": (0.0, 0.0), "base_pos_range_z": (0.3, 0.3)},
             "high_center_reach": {"name": "high_center_reach", "base_pos_range_x": (0.45, 0.65), "base_pos_range_y": (-0.2, 0.2), "base_pos_range_z": (0.5, 0.65)},
             "low_forward_reach": {"name": "low_forward_reach", "base_pos_range_x": (0.40, 0.60), "base_pos_range_y": (-0.2, 0.2), "base_pos_range_z": (0.05, 0.20)},
@@ -192,7 +202,7 @@ class FrankaShelfEnv(VecEnv):
         }
         self.shelf_config_keys_list: List[str] = list(
             self.shelf_configurations.keys())
-        self.default_shelf_config_key: str = "default_center_reach"  # MOD: Added
+        self.default_shelf_config_key: str = "default_center_reach"
 
     def _get_robot_state_parts_batched(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         joint_pos_all_batch = to_numpy(
@@ -209,31 +219,14 @@ class FrankaShelfEnv(VecEnv):
         return arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, ee_orient_quat_wxyz_batch
 
     def _build_shelf_structure_and_populate_params_batched(self) -> None:
-        self.shelf_component_params_batch.fill(
-            0.0)  # MOD: Initialize with zeros
-
-        if not self.include_shelf:  # MOD: Handle no shelf case
-            for i in range(self.num_envs):
-                self.current_shelf_config_key_per_env[i] = "no_shelf"
-                self.current_shelf_instance_params_per_env[i] = {
-                    "shelf_assembly_origin_world": np.zeros(3, dtype=np.float32),
-                    "shelf_assembly_yaw": 0.0,
-                    "actual_opening_height": 0.0,
-                    "internal_width": 0.0,
-                    "internal_depth": 0.0,
-                }
-            # Hide shelf entities if they were created (though ideally they are not if include_shelf is False)
-            for component_entity in self.shelf_component_entities:
-                component_entity.set_pos(torch.tensor(
-                    [[0, -1000, 0]] * self.num_envs, device=gs.device, dtype=torch.float32))  # Move far away
-            return
+        self.shelf_component_params_batch.fill(0.0)
 
         shelf_assembly_origins_world_batch = np.zeros(
             (self.num_envs, 3), dtype=np.float32)
         shelf_assembly_yaws_batch = np.zeros(self.num_envs, dtype=np.float32)
 
         for i in range(self.num_envs):
-            if self.randomize_shelf_config:  # MOD: Use new flag
+            if self.randomize_shelf_config:
                 config_key = random.choice(self.shelf_config_keys_list)
             else:
                 config_key = self.default_shelf_config_key
@@ -319,13 +312,11 @@ class FrankaShelfEnv(VecEnv):
         """Draws the workspace boundaries as a semi-transparent box."""
         if not self.scene:
             return
-        # print("Drawing workspace bounds.") # Original had this print
         min_coords = [self.workspace_bounds_x[0],
                       self.workspace_bounds_y[0], self.workspace_bounds_z[0]]
         max_coords = [self.workspace_bounds_x[1],
                       self.workspace_bounds_y[1], self.workspace_bounds_z[1]]
         bounds = np.array([min_coords, max_coords], dtype=np.float32)
-        # Original alpha was 1.0
         color_rgba = np.array([0.3, 0.3, 0.3, 1.0], dtype=np.float32)
         try:
             self.scene.draw_debug_box(bounds, color=color_rgba, wireframe=True)
@@ -335,48 +326,47 @@ class FrankaShelfEnv(VecEnv):
     def _generate_target_in_shelf_batched(self) -> np.ndarray:
         self.target_position_world_batch.fill(0.0)
         for i in range(self.num_envs):
-            if self.include_shelf:  # MOD: Use new flag
-                params = self.current_shelf_instance_params_per_env[i]
-                open_w, open_d, open_h = params["internal_width"], params[
-                    "internal_depth"], params["actual_opening_height"]
-                target_in_shelf_opening_frame = np.array([random.uniform(-open_w/2*0.7, open_w/2*0.7), random.uniform(
-                    -open_d/2*0.7, open_d/2*0.3), random.uniform(-open_h/2*0.8, open_h/2*0.8)], dtype=np.float32)
-                shelf_assembly_origin_world = params["shelf_assembly_origin_world"]
-                shelf_assembly_yaw = params["shelf_assembly_yaw"]
-                offset_to_opening_center_local = np.array(
-                    [0, 0, self.DEFAULT_PLATE_THICKNESS+open_h/2.0], dtype=np.float32)
-                shelf_assembly_quat_world_wxyz = np.array([np.cos(
-                    shelf_assembly_yaw/2.0), 0, 0, np.sin(shelf_assembly_yaw/2.0)], dtype=np.float32)
-                shelf_assembly_quat_world_xyzw = shelf_assembly_quat_world_wxyz[[
-                    1, 2, 3, 0]]
-                R_shelf_yaw_world = ScipyRotation.from_quat(
-                    shelf_assembly_quat_world_xyzw).as_matrix()
-                opening_center_world = shelf_assembly_origin_world + \
-                    (R_shelf_yaw_world @ offset_to_opening_center_local)
-                target_offset_world_rotated = R_shelf_yaw_world @ target_in_shelf_opening_frame
-                self.target_position_world_batch[i] = opening_center_world + \
-                    target_offset_world_rotated
-            else:  # MOD: Handle no shelf case
-                padding_x = (
-                    self.workspace_bounds_x[1] - self.workspace_bounds_x[0]) * 0.1
-                padding_y = (
-                    self.workspace_bounds_y[1] - self.workspace_bounds_y[0]) * 0.1
-                padding_z = (
-                    self.workspace_bounds_z[1] - self.workspace_bounds_z[0]) * 0.1
-                self.target_position_world_batch[i, 0] = random.uniform(
-                    self.workspace_bounds_x[0] + padding_x, self.workspace_bounds_x[1] - padding_x)
-                self.target_position_world_batch[i, 1] = random.uniform(
-                    self.workspace_bounds_y[0] + padding_y, self.workspace_bounds_y[1] - padding_y)
-                self.target_position_world_batch[i, 2] = random.uniform(
-                    self.workspace_bounds_z[0] + padding_z, self.workspace_bounds_z[1] - padding_z)
+            params = self.current_shelf_instance_params_per_env[i]
+            open_w, open_d, open_h = params["internal_width"], params[
+                "internal_depth"], params["actual_opening_height"]
+            target_in_shelf_opening_frame = np.array([random.uniform(-open_w/2*0.7, open_w/2*0.7), random.uniform(
+                -open_d/2*0.7, open_d/2*0.3), random.uniform(-open_h/2*0.8, open_h/2*0.8)], dtype=np.float32)
+            shelf_assembly_origin_world = params["shelf_assembly_origin_world"]
+            shelf_assembly_yaw = params["shelf_assembly_yaw"]
+            offset_to_opening_center_local = np.array(
+                [0, 0, self.DEFAULT_PLATE_THICKNESS+open_h/2.0], dtype=np.float32)
+            shelf_assembly_quat_world_wxyz = np.array([np.cos(
+                shelf_assembly_yaw/2.0), 0, 0, np.sin(shelf_assembly_yaw/2.0)], dtype=np.float32)
+            shelf_assembly_quat_world_xyzw = shelf_assembly_quat_world_wxyz[[
+                1, 2, 3, 0]]
+            R_shelf_yaw_world = ScipyRotation.from_quat(
+                shelf_assembly_quat_world_xyzw).as_matrix()
+            opening_center_world = shelf_assembly_origin_world + \
+                (R_shelf_yaw_world @ offset_to_opening_center_local)
+            target_offset_world_rotated = R_shelf_yaw_world @ target_in_shelf_opening_frame
+            self.target_position_world_batch[i] = opening_center_world + \
+                target_offset_world_rotated
 
         if self.scene and hasattr(self.scene, 'clear_debug_objects'):
             self.scene.clear_debug_objects()
-        if self.render_mode == "human" and self.scene:
-            points_to_draw = [self.target_position_world_batch[env_idx].tolist(
-            ) for env_idx in range(self.num_envs)]
-            self.scene.draw_debug_spheres(
-                points_to_draw, radius=0.03, color=(0, 1, 0, 0.8))
+
+        if self.scene and (self.render_mode == "human" or self._is_recording_active):
+            if self._num_envs == 1:
+                if self.target_position_world_batch[0] is not None:
+                    points_to_draw = [
+                        self.target_position_world_batch[0].tolist()]
+                    self.scene.draw_debug_spheres(
+                        points_to_draw, radius=0.03, color=(0.0, 1.0, 0.0, 0.8))
+            elif self._num_envs > 1 and self.target_sphere_entity_type is not None:
+                valid_targets = np.asarray(
+                    self.target_position_world_batch, dtype=np.float32)
+                if valid_targets.ndim == 2 and valid_targets.shape[0] == self._num_envs and valid_targets.shape[1] == 3:
+                    target_pos_tensor_all_envs = torch.tensor(
+                        valid_targets, device=gs.device, dtype=torch.float32)
+                    self.target_sphere_entity_type.set_pos(
+                        target_pos_tensor_all_envs)
+
+        if self.render_mode == "human" and self.scene and self._num_envs == 1:
             self._draw_workspace_bounds()
         return self.target_position_world_batch
 
@@ -421,16 +411,32 @@ class FrankaShelfEnv(VecEnv):
             self.franka_entity.set_dofs_velocity(
                 qvel_tensor, self.franka_all_dof_indices_local)
         self.prev_joint_vel_batch.fill(0.0)
+        # MOD: Call this before generating target if shelf is included
         self._build_shelf_structure_and_populate_params_batched()
         self._generate_target_in_shelf_batched()
         obs_batch = self._get_obs_batched()
         self.buf_infos = [{} for _ in range(self.num_envs)]
         for i in range(self.num_envs):
             self.buf_infos[i]["shelf_config"] = self.current_shelf_config_key_per_env[i]
-            # MOD: Added
             self.buf_infos[i]["include_shelf"] = self.include_shelf
-            # MOD: Added
             self.buf_infos[i]["randomize_shelf"] = self.randomize_shelf_config
+            # Log initial diagnostic values
+            if obs_batch["relative_target_pos"] is not None and len(obs_batch["relative_target_pos"]) > i:
+                # MOD: Using slash for W&B grouping
+                self.buf_infos[i]["diagnostics/distance_to_target"] = float(
+                    np.linalg.norm(obs_batch["relative_target_pos"][i]))
+                self.buf_infos[i]["diagnostics/ee_pos_x"] = float(
+                    obs_batch["robot_state_flat"][i, self.FRANKA_NUM_ARM_JOINTS*2])
+                self.buf_infos[i]["diagnostics/ee_pos_y"] = float(
+                    obs_batch["robot_state_flat"][i, self.FRANKA_NUM_ARM_JOINTS*2+1])
+                self.buf_infos[i]["diagnostics/ee_pos_z"] = float(
+                    obs_batch["robot_state_flat"][i, self.FRANKA_NUM_ARM_JOINTS*2+2])
+                self.buf_infos[i]["diagnostics/target_pos_x"] = float(
+                    self.target_position_world_batch[i, 0])
+                self.buf_infos[i]["diagnostics/target_pos_y"] = float(
+                    self.target_position_world_batch[i, 1])
+                self.buf_infos[i]["diagnostics/target_pos_z"] = float(
+                    self.target_position_world_batch[i, 2])
         return obs_batch
 
     def step_async(
@@ -439,21 +445,24 @@ class FrankaShelfEnv(VecEnv):
     def _calculate_rewards_and_dones(self, actions_clipped_batch: np.ndarray, arm_joint_pos_batch: np.ndarray, arm_joint_vel_batch: np.ndarray, ee_pos_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         dist_to_target_batch = np.linalg.norm(
             ee_pos_batch - self.target_position_world_batch, axis=1)
-        reward_distance = -self.k_dist_reward * dist_to_target_batch
-        time_penalty = -self.k_time_penalty * \
+
+        reward_dist = -self.k_dist_reward * dist_to_target_batch
+        penalty_time = -self.k_time_penalty * \
             np.ones(self.num_envs, dtype=np.float32)
-        action_penalty = -self.k_action_penalty * \
+        penalty_action_mag = -self.k_action_penalty * \
             np.sum(np.square(actions_clipped_batch), axis=1)
-        joint_pos_penalty = np.zeros(self.num_envs, dtype=np.float32)
+
+        penalty_joint_limit = np.zeros(self.num_envs, dtype=np.float32)
         near_limit_thresh = 0.05
         for i in range(self.FRANKA_NUM_ARM_JOINTS):
-            joint_pos_penalty -= self.k_joint_limit_penalty * \
+            penalty_joint_limit -= self.k_joint_limit_penalty * \
                 np.maximum(
                     0, (self.FRANKA_QPOS_LOWER[i] + near_limit_thresh) - arm_joint_pos_batch[:, i])
-            joint_pos_penalty -= self.k_joint_limit_penalty * \
+            penalty_joint_limit -= self.k_joint_limit_penalty * \
                 np.maximum(
                     0, arm_joint_pos_batch[:, i] - (self.FRANKA_QPOS_UPPER[i] - near_limit_thresh))
-        collision_penalty = np.zeros(self.num_envs, dtype=np.float32)
+
+        penalty_collision = np.zeros(self.num_envs, dtype=np.float32)
         terminated_collision = np.zeros(self.num_envs, dtype=bool)
         if self.scene and self.scene.is_built and self.franka_entity:
             contacts = self.franka_entity.get_contacts()
@@ -461,32 +470,57 @@ class FrankaShelfEnv(VecEnv):
                 valid_mask = to_numpy(contacts['valid_mask'])
                 for i_env in range(self.num_envs):
                     if np.any(valid_mask[i_env, :]):
-                        collision_penalty[i_env] -= self.k_collision_penalty
+                        penalty_collision[i_env] = -self.k_collision_penalty
                         terminated_collision[i_env] = True
-        success_reward = np.zeros(self.num_envs, dtype=np.float32)
+
+        reward_success = np.zeros(self.num_envs, dtype=np.float32)
         terminated_success = dist_to_target_batch < self.success_threshold
-        success_reward[terminated_success] = self.success_reward
-        accel_penalty = np.zeros(self.num_envs, dtype=np.float32)
+        reward_success[terminated_success] = self.success_reward
+
+        penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
         if self.k_accel_penalty > 0 and self.dt > 0:
-            accel_penalty = -self.k_accel_penalty * \
-                np.sum(np.square((arm_joint_vel_batch -
-                       self.prev_joint_vel_batch) / self.dt), axis=1)
-        rewards = reward_distance + time_penalty + action_penalty + \
-            joint_pos_penalty + collision_penalty + success_reward + accel_penalty
+            acceleration_sq_sum = np.sum(np.square((arm_joint_vel_batch -
+                                                    self.prev_joint_vel_batch) / self.dt), axis=1)
+            penalty_accel = -self.k_accel_penalty * acceleration_sq_sum
+
+        rewards = reward_dist + penalty_time + penalty_action_mag + \
+            penalty_joint_limit + penalty_collision + reward_success + penalty_accel
+
         terminated = np.logical_or(terminated_collision, terminated_success)
         truncated = self.current_step_per_env >= self.max_steps
         dones = np.logical_or(terminated, truncated)
+
         infos = []
         for i in range(self.num_envs):
-            info = {"is_success": terminated_success[i], "distance_to_target": float(
-                dist_to_target_batch[i]), "collision_detected": terminated_collision[i], "current_step": self.current_step_per_env[i],
+            info = {
+                "is_success": terminated_success[i],
+                # MOD: Using slash for W&B grouping
+                "diagnostics/distance_to_target": float(dist_to_target_batch[i]),
+                "diagnostics/collision_detected_term": terminated_collision[i],
+                "current_step": self.current_step_per_env[i],
                 "shelf_config": self.current_shelf_config_key_per_env[i],
-                "include_shelf": self.include_shelf,  # MOD: Added
-                "randomize_shelf": self.randomize_shelf_config  # MOD: Added
+                "include_shelf": self.include_shelf,
+                "randomize_shelf": self.randomize_shelf_config,
+                "rewards/distance": float(reward_dist[i]),
+                "rewards/time_penalty": float(penalty_time[i]),
+                "rewards/action_penalty": float(penalty_action_mag[i]),
+                "rewards/joint_limit_penalty": float(penalty_joint_limit[i]),
+                "rewards/collision_penalty": float(penalty_collision[i]),
+                "rewards/success": float(reward_success[i]),
+                "rewards/accel_penalty": float(penalty_accel[i]),
+                "diagnostics/ee_pos_x": float(ee_pos_batch[i, 0]),
+                "diagnostics/ee_pos_y": float(ee_pos_batch[i, 1]),
+                "diagnostics/ee_pos_z": float(ee_pos_batch[i, 2]),
+                "diagnostics/target_pos_x": float(self.target_position_world_batch[i, 0]),
+                "diagnostics/target_pos_y": float(self.target_position_world_batch[i, 1]),
+                "diagnostics/target_pos_z": float(self.target_position_world_batch[i, 2]),
+                "diagnostics/mean_qpos_j1-3": float(np.mean(arm_joint_pos_batch[i, :3])),
+                "diagnostics/mean_qvel_j1-3": float(np.mean(arm_joint_vel_batch[i, :3])),
             }
             if dones[i] and truncated[i] and not terminated[i]:
                 info["TimeLimit.truncated"] = True
             infos.append(info)
+
         return rewards, dones, terminated, infos
 
     def step_wait(self) -> VecEnvStepReturn:
@@ -495,8 +529,6 @@ class FrankaShelfEnv(VecEnv):
         actions_batch = self.actions_buffer
         self.current_step_per_env += 1
         actions_clipped = np.clip(actions_batch, -1.0, 1.0).astype(np.float32)
-        # MOD: Original scaling was: scaled_targets = actions_clipped * self.max_allowable_joint_velocity_scale
-        # This should be scaled by actual velocity limits if max_allowable_joint_velocity_scale is a fraction
         scaled_targets = actions_clipped * \
             self.max_allowable_joint_velocity_scale * self.FRANKA_VEL_LIMIT
 
@@ -521,13 +553,33 @@ class FrankaShelfEnv(VecEnv):
     def render(self, mode: Optional[str] = 'human') -> Optional[Union[np.ndarray, List[np.ndarray]]]:
         if mode == "human" and self.render_mode == "human":
             if self.scene:
+                if self._num_envs == 1:
+                    if hasattr(self.scene, "draw_debug_spheres") and self.target_position_world_batch[0] is not None:
+                        points_to_draw = [
+                            self.target_position_world_batch[0].tolist()]
+                        self.scene.draw_debug_spheres(
+                            points_to_draw, radius=0.03, color=(0.0, 1.0, 0.0, 0.8))
+                elif self._num_envs > 1 and self.target_sphere_entity_type is not None:
+                    valid_targets = np.asarray(
+                        self.target_position_world_batch, dtype=np.float32)
+                    if valid_targets.ndim == 2 and valid_targets.shape[0] == self._num_envs and valid_targets.shape[1] == 3:
+                        target_pos_tensor_all_envs = torch.tensor(
+                            valid_targets, device=gs.device, dtype=torch.float32)
+                        self.target_sphere_entity_type.set_pos(
+                            target_pos_tensor_all_envs)
                 self._draw_workspace_bounds()
             return None
         elif mode == "rgb_array":
-            if not self.video_capture_camera:
-                dummy_res = self.video_camera_params.get('res', (64, 64))
-                return np.zeros((*dummy_res, 3), dtype=np.uint8)
             try:
+                if self._num_envs > 1 and self.target_sphere_entity_type is not None:
+                    valid_targets = np.asarray(
+                        self.target_position_world_batch, dtype=np.float32)
+                    if valid_targets.ndim == 2 and valid_targets.shape[0] == self._num_envs and valid_targets.shape[1] == 3:
+                        target_pos_tensor_all_envs = torch.tensor(
+                            valid_targets, device=gs.device, dtype=torch.float32)
+                        self.target_sphere_entity_type.set_pos(
+                            target_pos_tensor_all_envs)
+
                 rgb_output, _, _, _ = self.video_capture_camera.render(
                     rgb=True, depth=False, segmentation=False, normal=False)
                 return rgb_output[0] if isinstance(rgb_output, list) and rgb_output else rgb_output
@@ -554,6 +606,7 @@ class FrankaShelfEnv(VecEnv):
                 pass
             finally:
                 self.scene = None
+        self.target_sphere_entity_type = None
 
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
         data = getattr(self, attr_name)
@@ -584,14 +637,27 @@ class FrankaShelfEnv(VecEnv):
             self._is_recording_active = True
             if self.scene and hasattr(self.scene, 'clear_debug_objects'):
                 self.scene.clear_debug_objects()
-            if self.scene and (self.num_envs == 1 or env_idx_to_focus == 0):
-                # MOD: Ensure target_position_world_batch is valid for the focused env
-                if 0 <= env_idx_to_focus < self.num_envs:
-                    self.scene.draw_debug_spheres(
-                        [self.target_position_world_batch[env_idx_to_focus].tolist()], radius=0.03, color=(0, 1, 0, 0.8))
+
+            if self.scene:
+                if self._num_envs == 1:
+                    if 0 <= env_idx_to_focus < self._num_envs and self.target_position_world_batch[env_idx_to_focus] is not None:
+                        points_to_draw = [
+                            self.target_position_world_batch[env_idx_to_focus].tolist()]
+                        self.scene.draw_debug_spheres(
+                            points_to_draw, radius=0.03, color=(0.0, 1.0, 0.0, 0.8))
+                elif self._num_envs > 1 and self.target_sphere_entity_type is not None:
+                    valid_targets = np.asarray(
+                        self.target_position_world_batch, dtype=np.float32)
+                    if valid_targets.ndim == 2 and valid_targets.shape[0] == self._num_envs and valid_targets.shape[1] == 3:
+                        target_pos_tensor_all_envs = torch.tensor(
+                            valid_targets, device=gs.device, dtype=torch.float32)
+                        self.target_sphere_entity_type.set_pos(
+                            target_pos_tensor_all_envs)
+
                 self._draw_workspace_bounds()
             return True
-        except Exception:
+        except Exception as e:
+            print(f"Error in start_video_recording: {e}")
             self._is_recording_active = False
             return False
 
@@ -605,7 +671,8 @@ class FrankaShelfEnv(VecEnv):
             self.video_capture_camera.stop_recording(
                 save_to_filename=full_path, fps=fps)
             return full_path
-        except Exception:
+        except Exception as e:
+            print(f"Error in stop_video_recording: {e}")
             return None
         finally:
             self._is_recording_active = False
@@ -625,11 +692,12 @@ if __name__ == '__main__':
             f"CRITICAL ERROR: Failed to initialize Genesis for testing: {e_init}\nExiting.")
         sys.exit(1)
 
-    NUM_TEST_ENVS = 1
+    num_test_envs_for_run = 5  # MOD: Changed to 1 for more focused testing of info dict
+    print(f"\n\n--- TESTING WITH NUM_ENVS = {num_test_envs_for_run} ---")
+    NUM_TEST_ENVS = num_test_envs_for_run
     env = None
     try:
-        # MOD: Test scenarios for new flags
-        test_scenario = 1  # Change this to 1, 2, or 3
+        test_scenario = 3  # Test with no shelf for simplicity of reward debugging
 
         if test_scenario == 1:
             print(
@@ -645,10 +713,14 @@ if __name__ == '__main__':
             print(
                 f"\nCreating FrankaShelfEnv (Shelf OFF) num_envs={NUM_TEST_ENVS}, render_mode='human'")
             env = FrankaShelfEnv(num_envs=NUM_TEST_ENVS, render_mode="human",
-                                 include_shelf=False, randomize_shelf_config=False)  # randomize doesn't matter
+                                 include_shelf=False, randomize_shelf_config=False)
         else:
             print("Invalid test_scenario.")
             sys.exit(1)
+
+        if env is None:
+            print("ERROR: Environment was not created.")
+            # sys.exit(1) # Exit if env is None after conditional creation
 
         print(
             f"FrankaShelfEnv created. Obs Space: {env.observation_space}, Act Space: {env.action_space}")
@@ -656,45 +728,51 @@ if __name__ == '__main__':
             f"  Include Shelf: {env.include_shelf}, Randomize Shelf: {env.randomize_shelf_config}")
 
         print("\nResetting environment...")
-        # MOD: Added seed for test reproducibility
         obs_batch = env.reset(seed=42)
-        print("Sample observation (first env):")
-        for key, value in obs_batch.items():
-            print(f"  {key}: shape {value[0].shape if isinstance(value, np.ndarray) and value.ndim > 1 else np.array(value[0]).shape}, sample data: {value[0][:5] if isinstance(value[0], np.ndarray) and value[0].ndim >0 and value[0].size > 5 else value[0]}")
+        print("Sample observation (first env if exists):")
+        if obs_batch is not None and NUM_TEST_ENVS > 0:
+            for key, value in obs_batch.items():  # type: ignore
+                print(f"  {key}: shape {value[0].shape if isinstance(value, np.ndarray) and value.ndim > 1 and value.shape[0] > 0 else np.array(value[0]).shape if NUM_TEST_ENVS==1 else 'N/A for multi-env sample'}, sample data: {value[0][:5] if isinstance(value[0], np.ndarray) and value[0].ndim >0 and value[0].size > 5 else value[0] if NUM_TEST_ENVS==1 else 'N/A for multi-env sample'}")
         print(
-            f"  Initial shelf config key: {env.current_shelf_config_key_per_env[0]}")
+            f"  Initial shelf config key: {env.current_shelf_config_key_per_env[0] if NUM_TEST_ENVS > 0 else 'N/A'}")
+        if NUM_TEST_ENVS > 0 and env.buf_infos[0]:
+            print(f"  Initial info for env 0: {env.buf_infos[0]}")
 
         if env.scene and env.render_mode == "human":
             print("Stepping scene for initial view (simulating render loop)...")
-            for _ in range(60):
+            for _ in range(30):
                 if env.scene:
                     env.scene.step()
 
         print("\nRunning a short loop with random actions for visualization...")
-        for step_num in range(200):  # MOD: Reduced steps for quicker test
+        for step_num in range(300):  # MOD: Shorter loop for testing info dict
             actions = np.array([env.action_space.sample()
-                               for _ in range(env.num_envs)])
+                                for _ in range(env.num_envs)])
             env.step_async(actions)
             next_obs_batch, rewards_b, dones_b, infos_b = env.step_wait()
 
-            if (step_num + 1) % 20 == 0:
+            if env.render_mode == "human":
+                env.render(mode="human")
+
+            if (step_num + 1) % 5 == 0:  # MOD: Log more frequently
                 print(
-                    f"  Step {step_num+1} completed. Reward: {rewards_b[0]:.2f}, Done: {dones_b[0]}, Success: {infos_b[0].get('is_success', False)}")
-                if dones_b[0]:
-                    print(f"  Episode ended. Info: {infos_b[0]}")
-                    # MOD: Re-seed on reset
-                    obs_batch = env.reset(seed=42+step_num+1)
-                    print(
-                        f"  New shelf config key: {env.current_shelf_config_key_per_env[0]}")
+                    f"  Step {step_num+1} completed. Reward: {rewards_b[0]:.2f}, Done: {dones_b[0]}, Success: {infos_b[0].get('is_success', False) if NUM_TEST_ENVS > 0 else 'N/A'}")
+                if NUM_TEST_ENVS > 0 and infos_b[0]:
+                    # Print the full info dict for debugging
+                    print(f"    Info env 0: {infos_b[0]}")
+                if dones_b[0] and NUM_TEST_ENVS > 0:
+                    print(f"  Episode ended for env 0. Info: {infos_b[0]}")
         print("\nBasic visualization loop finished.")
     except Exception as e_runtime:
-        print(f"ERROR during FrankaShelfEnv example usage: {e_runtime}")
+        print(
+            f"ERROR during FrankaShelfEnv example usage (NUM_ENVS={NUM_TEST_ENVS}): {e_runtime}")
         traceback.print_exc()
     finally:
         if env:
             print("Closing environment...")
             env.close()
-        if gs_initialized_in_main and hasattr(gs, 'shutdown') and callable(gs.shutdown):
-            print("Shutting down Genesis post-testing.")
-            gs.shutdown()
-        print("--- FrankaShelfEnv Test Script Finished ---")
+
+    if gs_initialized_in_main and hasattr(gs, 'shutdown') and callable(gs.shutdown):
+        print("Shutting down Genesis post-testing.")
+        gs.shutdown()
+    print("--- FrankaShelfEnv Test Script Finished ---")

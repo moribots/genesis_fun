@@ -399,7 +399,8 @@ def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
                 log_dir, f"wandb_models/{wandb_run_instance.id}"),
             model_save_freq=samples_per_ppo_rollout *
             config.get("wandb_model_save_freq_rollouts", 0),
-            gradient_save_freq=0,
+            gradient_save_freq=samples_per_ppo_rollout *
+            config.get("wandb_model_save_freq_rollouts", 0),
             log="all",  # This will continue to log SB3 default logger content
             verbose=2
         )
@@ -583,13 +584,13 @@ if __name__ == '__main__':
         "seed": 42,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "n_steps_ppo": 1024,                 # MODIFIED from 256
+        "n_steps_ppo": 128,
         "batch_size_ppo": 2048,
-        "n_epochs_ppo": 10,
-        "learning_rate": 3e-4,               # MODIFIED from 5e-4
+        "n_epochs_ppo": 5,
+        "learning_rate": 3e-4,
         "clip_range": 0.2,
-        "ent_coef": 0.01,
-        "vf_coef": 0.5,
+        "ent_coef": 0.001,
+        "vf_coef": 1.0,  # value function coefficient
         "max_grad_norm": 0.5,
         "total_timesteps": 100_000_000,
         "num_genesis_envs": 1024,
@@ -606,7 +607,7 @@ if __name__ == '__main__':
 
         "checkpoint_save_freq_rollouts": 5,
         "eval_freq_rollouts": 5,
-        "video_log_freq_multiplier": 1,
+        "video_log_freq_multiplier": 3,
         "video_length": 300,
         "video_fps": 30,
 

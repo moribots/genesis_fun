@@ -63,9 +63,9 @@ class FrankaShelfEnv(VecEnv):
 
     # Per-DOF noise ranges (min_noise, max_noise) for arm joint positions during reset
     FRANKA_QPOS_RESET_NOISE_RANGES: np.ndarray = np.array([
-        (-1.0, 1.0), (-0.5, 0.5), (-0.3, 0.3), (-0.2, 0.2),  # Joints 1-4
+        (-1.0, 1.0), (-0.2, 0.2), (-0.2, 0.2), (-0.2, 0.2),  # Joints 1-4
         # Joints 5-7 (less noise for potentially more sensitive joints)
-        (-0.2, 0.2), (-0.15, 0.15), (-0.1, 0.1)
+        (-0.1, 0.1), (-0.1, 0.1), (-0.1, 0.1)
     ], dtype=np.float32)
 
     DEFAULT_PLATE_WIDTH: float = 0.5
@@ -203,15 +203,47 @@ class FrankaShelfEnv(VecEnv):
 
     def _define_shelf_configurations(self) -> None:
         self.shelf_configurations: Dict[str, Dict[str, Any]] = {
-            "default_center_reach": {"name": "default_center_reach", "base_pos_range_x": (-0.55, 0.55), "base_pos_range_y": (0.0, 0.0), "base_pos_range_z": (0.3, 0.3)},
-            "high_center_reach": {"name": "high_center_reach", "base_pos_range_x": (-0.45, 0.65), "base_pos_range_y": (-0.2, 0.2), "base_pos_range_z": (0.4, 0.65)},
-            "low_forward_reach": {"name": "low_forward_reach", "base_pos_range_x": (-0.40, 0.60), "base_pos_range_y": (-0.2, 0.2), "base_pos_range_z": (0.1, 0.30)},
-            "mid_side_reach_right": {"name": "mid_side_reach_right", "base_pos_range_x": (0.25, 0.5), "base_pos_range_y": (-0.4, 0.6), "base_pos_range_z": (0.2, 0.5)},
-            "mid_side_reach_left": {"name": "mid_side_reach_left", "base_pos_range_x": (0.25, 0.5), "base_pos_range_y": (-0.6, -0.4), "base_pos_range_z": (0.2, 0.5)}
+            "default_center_reach": {
+                "name": "default_center_reach",
+                "base_pos_range_x": [(-0.6, -0.35), (0.35, 0.6)],
+                "base_pos_range_y": (0.0, 0.0),
+                "base_pos_range_z": (0.3, 0.3)
+            },
+            "high_center_reach": {
+                "name": "high_center_reach",
+                "base_pos_range_x": [(-0.6, -0.35), (0.35, 0.6)],
+                "base_pos_range_y": (-0.4, 0.4),
+                "base_pos_range_z": (0.4, 0.65)
+            },
+            "low_forward_reach": {
+                "name": "low_forward_reach",
+                "base_pos_range_x": [(-0.60, -0.35), (0.35, 0.60)],
+                "base_pos_range_y": (-0.4, 0.4),
+                "base_pos_range_z": (0.1, 0.30)
+            },
+            "mid_side_reach_right": {
+                "name": "mid_side_reach_right",
+                "base_pos_range_x": [(0.3, 0.5)],
+                "base_pos_range_y": (-0.6, 0.6),
+                "base_pos_range_z": (0.2, 0.5)
+            },
+            "mid_side_reach_left": {
+                "name": "mid_side_reach_left",
+                "base_pos_range_x": [(-0.5, -0.3)],
+                "base_pos_range_y": (-0.6, -0.6),
+                "base_pos_range_z": (0.2, 0.5)
+            }
         }
         self.shelf_config_keys_list: List[str] = list(
             self.shelf_configurations.keys())
         self.default_shelf_config_key: str = "default_center_reach"
+        # Validate buffer zone for X ranges
+        buffer_half_width = 0.2
+        for key, config_details in self.shelf_configurations.items():
+            for x_range_tuple in config_details["base_pos_range_x"]:
+                if not (x_range_tuple[1] <= -buffer_half_width or x_range_tuple[0] >= buffer_half_width):
+                    raise ValueError(
+                        f"Configuration '{key}' x_range {x_range_tuple} violates the buffer zone (-{buffer_half_width}, {buffer_half_width}).")
 
     def _get_robot_state_parts_batched(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         joint_pos_all_batch = to_numpy(
@@ -249,8 +281,12 @@ class FrankaShelfEnv(VecEnv):
             self.current_shelf_config_key_per_env[i] = config_key
             config = self.shelf_configurations[config_key]
 
+            # Sample X from the (potentially disjoint) ranges
+            x_ranges_for_config = config["base_pos_range_x"]
+            chosen_x_sub_range = random.choice(x_ranges_for_config)
             shelf_assembly_origins_world_batch[i, 0] = random.uniform(
-                *config["base_pos_range_x"])
+                *chosen_x_sub_range)
+
             shelf_assembly_origins_world_batch[i, 1] = random.uniform(
                 *config["base_pos_range_y"])
             shelf_assembly_origins_world_batch[i, 2] = random.uniform(
@@ -776,7 +812,7 @@ if __name__ == '__main__':
         print(
             f"\nCreating FrankaShelfEnv (Shelf OFF) num_envs={NUM_TEST_ENVS}, render_mode='human'")
         env = FrankaShelfEnv(num_envs=NUM_TEST_ENVS, render_mode="human",
-                             include_shelf=False, randomize_shelf_config=False,  # Using default_center_reach
+                             include_shelf=True, randomize_shelf_config=True,  # Using default_center_reach
                              )
 
         print(

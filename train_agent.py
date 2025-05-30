@@ -583,10 +583,10 @@ if __name__ == '__main__':
         "seed": 42,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "n_steps_ppo": 256,
+        "n_steps_ppo": 1024,                 # MODIFIED from 256
         "batch_size_ppo": 2048,
         "n_epochs_ppo": 10,
-        "learning_rate": 5e-4,
+        "learning_rate": 3e-4,               # MODIFIED from 5e-4
         "clip_range": 0.2,
         "ent_coef": 0.01,
         "vf_coef": 0.5,
@@ -618,7 +618,7 @@ if __name__ == '__main__':
         "k_accel_penalty": 0.005,
         "success_reward_val": 350.0,
         "success_threshold_val": 0.05,
-        "max_steps_per_episode": 300,
+        "max_steps_per_episode": 500,        # MODIFIED from 300
 
         'video_camera_pos_override': (1.8, -1.8, 2.0),
         'video_camera_lookat_override': (0.3, 0.0, 0.5),

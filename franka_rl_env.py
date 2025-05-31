@@ -201,6 +201,10 @@ class FrankaShelfEnv(VecEnv):
         self.buf_infos: List[Dict[str, Any]] = [{}
                                                 for _ in range(self.num_envs)]
 
+        self._build_shelf_structure_and_populate_params_batched()
+        # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
+        self._generate_target_in_shelf_batched()
+
     def _define_shelf_configurations(self) -> None:
         self.shelf_configurations: Dict[str, Dict[str, Any]] = {
             "default_center_reach": {
@@ -281,16 +285,28 @@ class FrankaShelfEnv(VecEnv):
             self.current_shelf_config_key_per_env[i] = config_key
             config = self.shelf_configurations[config_key]
 
-            # Sample X from the (potentially disjoint) ranges
-            x_ranges_for_config = config["base_pos_range_x"]
-            chosen_x_sub_range = random.choice(x_ranges_for_config)
-            shelf_assembly_origins_world_batch[i, 0] = random.uniform(
-                *chosen_x_sub_range)
+            if self.randomize_shelf_config:
+                # Sample X from the (potentially disjoint) ranges
+                x_ranges_for_config = config["base_pos_range_x"]
+                chosen_x_sub_range = random.choice(x_ranges_for_config)
+                shelf_assembly_origins_world_batch[i, 0] = random.uniform(
+                    *chosen_x_sub_range)
 
-            shelf_assembly_origins_world_batch[i, 1] = random.uniform(
-                *config["base_pos_range_y"])
-            shelf_assembly_origins_world_batch[i, 2] = random.uniform(
-                *config["base_pos_range_z"])
+                shelf_assembly_origins_world_batch[i, 1] = random.uniform(
+                    *config["base_pos_range_y"])
+                shelf_assembly_origins_world_batch[i, 2] = random.uniform(
+                    *config["base_pos_range_z"])
+            else:
+                # Deterministic generation using max dimensions from the default config
+                x_ranges_for_config = config["base_pos_range_x"]
+                shelf_assembly_origins_world_batch[i, 0] = max(
+                    r[1] for r in x_ranges_for_config)
+                # Max of y-range
+                shelf_assembly_origins_world_batch[i,
+                                                   1] = config["base_pos_range_y"][1]
+                # Max of z-range
+                shelf_assembly_origins_world_batch[i,
+                                                   2] = config["base_pos_range_z"][1]
 
             if "center" in config["name"] or "forward" in config["name"]:
                 shelf_assembly_yaws_batch[i] = math.atan2(
@@ -812,7 +828,7 @@ if __name__ == '__main__':
         print(
             f"\nCreating FrankaShelfEnv (Shelf OFF) num_envs={NUM_TEST_ENVS}, render_mode='human'")
         env = FrankaShelfEnv(num_envs=NUM_TEST_ENVS, render_mode="human",
-                             include_shelf=True, randomize_shelf_config=True,  # Using default_center_reach
+                             include_shelf=False, randomize_shelf_config=False,  # Using default_center_reach
                              )
 
         print(
@@ -849,15 +865,8 @@ if __name__ == '__main__':
             if env.render_mode == "human":
                 env.render(mode="human")
 
-            print(
-                f"  Step {step_num+1} completed. Reward: {rewards_b[0]:.2f}, Done: {dones_b[0]}")
-
             print("    Observed shelf_component_params for env 0:",
                   next_obs_batch["shelf_component_params"][0])
-
-            if dones_b[0] and NUM_TEST_ENVS > 0:
-                print(f"  Episode ended for env 0. Info: {infos_b[0]}")
-                # break # Uncomment to stop after first episode end for quicker testing
         print("\nBasic test loop finished.")
 
     except Exception as e_runtime:

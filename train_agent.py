@@ -611,7 +611,7 @@ if __name__ == '__main__':
         "video_length": 300,
         "video_fps": 30,
 
-        "k_dist_reward": 20.0,
+        "k_dist_reward": 50.0,
         "k_time_penalty": 0.02,
         "k_action_penalty": 0.005,
         "k_joint_limit_penalty": 15.0,

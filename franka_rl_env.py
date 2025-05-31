@@ -628,6 +628,7 @@ class FrankaShelfEnv(VecEnv):
                 "shelf_config": self.current_shelf_config_key_per_env[i],
                 "include_shelf": self.include_shelf,
                 "randomize_shelf": self.randomize_shelf_config,
+                "rewards/total": float(rewards[i]),
                 "rewards/distance": float(reward_dist[i]),
                 "rewards/time_penalty": float(penalty_time[i]),
                 "rewards/action_penalty": float(penalty_action_mag[i]),

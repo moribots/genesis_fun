@@ -48,7 +48,7 @@ class WandbDetailedMetricsCallback(BaseCallback):
         self.wandb_run = wandb_run_instance
         # Define the keys from the info dictionary that we want to log
         self.metrics_to_track = [
-            "diagnostics/distance_to_target",
+            "diagnostics/distance_to_target", "rewards/total",
             "rewards/distance", "rewards/time_penalty",
             "rewards/action_penalty", "rewards/joint_limit_penalty",
             "rewards/collision_penalty", "rewards/success", "rewards/accel_penalty",

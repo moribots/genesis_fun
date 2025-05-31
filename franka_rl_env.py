@@ -185,6 +185,10 @@ class FrankaShelfEnv(VecEnv):
             self.scene.build(n_envs=self.num_envs,
                              env_spacing=self.env_spacing)
 
+        self._build_shelf_structure_and_populate_params_batched()
+        # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
+        self._generate_target_in_shelf_batched()
+
         self.shelf_component_params_batch = np.zeros(
             (self.num_envs, self.SHELF_NUM_COMPONENTS, self.NUM_PARAMS_PER_SHELF_COMPONENT), dtype=np.float32)
         self.target_position_world_batch = np.zeros(
@@ -195,7 +199,7 @@ class FrankaShelfEnv(VecEnv):
             name).dof_idx_local for name in self.FRANKA_JOINT_NAMES], dtype=np.int32)
         self.franka_arm_dof_indices_local = self.franka_all_dof_indices_local[
             :self.FRANKA_NUM_ARM_JOINTS]
-        self.max_allowable_joint_velocity_scale = 0.5
+        self.max_allowable_joint_velocity_scale = 1.0
         self.actions_buffer = np.zeros(
             (self.num_envs, self.action_space.shape[0]), dtype=self.action_space.dtype)
         self.buf_infos: List[Dict[str, Any]] = [{}
@@ -525,13 +529,14 @@ class FrankaShelfEnv(VecEnv):
                 qvel_tensor, self.franka_all_dof_indices_local)
         self.prev_joint_vel_batch.fill(0.0)
 
-        # This populates self.shelf_component_params_batch and self.current_shelf_instance_params_per_env
-        # which are then used by _generate_target_in_shelf_batched.
-        # If self.include_shelf is True, it also sets poses of physical shelf entities.
-        self._build_shelf_structure_and_populate_params_batched()
-
-        # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
-        self._generate_target_in_shelf_batched()
+        # If we're not randomizing, just use the default shelf configuration
+        if self.randomize_shelf_config:
+            # This populates self.shelf_component_params_batch and self.current_shelf_instance_params_per_env
+            # which are then used by _generate_target_in_shelf_batched.
+            # If self.include_shelf is True, it also sets poses of physical shelf entities.
+            self._build_shelf_structure_and_populate_params_batched()
+            # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
+            self._generate_target_in_shelf_batched()
 
         # This will now zero out shelf_params if include_shelf is False
         obs_batch = self._get_obs_batched()
@@ -656,7 +661,7 @@ class FrankaShelfEnv(VecEnv):
 
         actions_tensor = torch.tensor(
             scaled_targets, device=gs.device, dtype=torch.float32)
-        self.franka_entity.control_dofs_velocity(
+        self.franka_entity.control_dofs_force(
             actions_tensor, self.franka_arm_dof_indices_local)
         self.scene.step()
         if self._is_recording_active and self.video_capture_camera:

@@ -185,10 +185,6 @@ class FrankaShelfEnv(VecEnv):
             self.scene.build(n_envs=self.num_envs,
                              env_spacing=self.env_spacing)
 
-        self._build_shelf_structure_and_populate_params_batched()
-        # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
-        self._generate_target_in_shelf_batched()
-
         self.shelf_component_params_batch = np.zeros(
             (self.num_envs, self.SHELF_NUM_COMPONENTS, self.NUM_PARAMS_PER_SHELF_COMPONENT), dtype=np.float32)
         self.target_position_world_batch = np.zeros(

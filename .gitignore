@@ -2,3 +2,4 @@ __pycache__/*
 wandb/*
 training_logs/*
 videos_env_test/*
+*.log

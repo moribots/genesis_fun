@@ -1,573 +1,598 @@
 """
-Main script for training a PPO agent on the FrankaShelfEnv environment.
+Main script for training a PPO agent on the FrankaShelfEnv environment using RSL-RL.
 
 This script handles:
 - Initialization of the Genesis simulation environment.
-- Configuration and setup of Weights & Biases (W&B) for experiment tracking.
-- Creation and wrapping of the FrankaShelfEnv vectorized environment.
-- Definition and instantiation of the PPO model from Stable Baselines3.
-- Setup of custom callbacks for video recording, model checkpointing, evaluation,
-  and W&B logging.
-- The main training loop.
+- Configuration of the training environment and the RSL-RL PPO algorithm.
+- Creation of the FrankaShelfEnv vectorized environment.
+- Instantiation and execution of a custom OnPolicyRunner, which manages the
+  entire training loop, including logging to Weights & Biases, checkpointing,
+  and periodic video recording.
 """
 import os
 import sys
-import getpass
-from typing import Optional, List, Dict, Any
-import numbers
-
 import traceback
-import torch
+from dataclasses import dataclass, asdict, fields, field
+import time
+from collections import deque
 import numpy as np
-import wandb
-from wandb.sdk.wandb_run import Run as WandbRun
+import statistics
 
+import torch
 import genesis as gs  # type: ignore
+from torch.utils.tensorboard import SummaryWriter
+import imageio
+import wandb
 
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
-from stable_baselines3.common.utils import set_random_seed, safe_mean
-from stable_baselines3.common.policies import ActorCriticPolicy  # Used by PPO
-from wandb.integration.sb3 import WandbCallback as WandbCallbackSB3
-
-# Environment with shelf parameter observation
 from franka_rl_env import FrankaShelfEnv
+from curriculum import CurriculumConfig
+from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.modules import ActorCritic
+from rsl_rl.algorithms import PPO
+from rsl_rl.utils.wandb_utils import WandbSummaryWriter
 
 
-class WandbDetailedMetricsCallback(BaseCallback):
+class CustomOnPolicyRunner(OnPolicyRunner):
     """
-    A custom callback to log detailed metrics from the environment's info dictionary
-    directly to Weights & Biases at the end of each rollout.
-    It calculates the mean of specified scalar metrics collected across all steps
-    and all environments within the rollout.
-    """
-
-    def __init__(self, wandb_run_instance: Optional[WandbRun], verbose=0):
-        super().__init__(verbose)
-        self.wandb_run = wandb_run_instance
-        # Define the keys from the info dictionary that we want to log
-        self.metrics_to_track = [
-            "diagnostics/distance_to_target",
-            "rewards/distance", "rewards/time_penalty",
-            "rewards/action_penalty", "rewards/joint_limit_penalty",
-            "rewards/collision_penalty", "rewards/success", "rewards/accel_penalty",
-            "diagnostics/ee_pos_x", "diagnostics/ee_pos_y", "diagnostics/ee_pos_z",
-            "diagnostics/target_pos_x", "diagnostics/target_pos_y", "diagnostics/target_pos_z",
-            "diagnostics/mean_qpos_j1-3", "diagnostics/mean_qvel_j1-3",
-            "is_success"  # Also log success rate within the rollout
-        ]
-        self.rollout_data = {key: [] for key in self.metrics_to_track}
-
-    def _on_training_start(self) -> None:
-        if self.verbose > 0:
-            print(
-                f"--- WandbDetailedMetricsCallback: Training started. Logging to W&B run: {self.wandb_run is not None} ---")
-            print(
-                f"--- WandbDetailedMetricsCallback: Tracking metrics: {self.metrics_to_track} ---")
-
-    def _on_rollout_start(self) -> None:
-        """
-        This method is called before a new rollout starts.
-        Clear accumulated metrics.
-        """
-        for key in self.metrics_to_track:
-            self.rollout_data[key] = []
-
-    def _on_step(self) -> bool:
-        """
-        This method is called after each step in the environment.
-        `self.locals["infos"]` is a list of info dicts for each environment at the current step.
-        """
-        infos_list = self.locals.get("infos", [])
-        for env_info in infos_list:
-            if env_info is None:
-                continue
-            for key in self.metrics_to_track:
-                if key in env_info:
-                    value = env_info[key]
-                    # Ensure value is scalar (int, float, or bool which converts to 0/1)
-                    if isinstance(value, (int, float, bool, np.bool_)):
-                        self.rollout_data[key].append(float(value))
-        return True
-
-    def _on_rollout_end(self) -> None:
-        """
-        This method is called at the end of each rollout.
-        Calculate means and log to W&B.
-        """
-        metrics_to_log_wandb = {}
-        for key, values_list in self.rollout_data.items():
-            if values_list:  # If we collected any data for this key
-                mean_value = float(np.mean(values_list))
-                # Log to SB3 logger (WandbCallbackSB3 might pick this up too if it logs all from logger)
-                self.logger.record(f"custom_rollout_stats/{key}", mean_value)
-                # Prepare for direct W&B logging
-                metrics_to_log_wandb[f"custom_rollout_stats/{key}"] = mean_value
-
-        if metrics_to_log_wandb and self.wandb_run is not None:
-            # MOD: Removed step=self.num_timesteps to avoid conflict with tensorboard syncing
-            self.wandb_run.log(metrics_to_log_wandb)
-            if self.verbose > 0:
-                print(
-                    f"--- WandbDetailedMetricsCallback: Logged {len(metrics_to_log_wandb)} custom metrics to W&B at total steps {self.num_timesteps} ---")
-
-        # Clear for the next rollout (already done in _on_rollout_start, but good for safety)
-        for key in self.metrics_to_track:
-            self.rollout_data[key] = []
-
-
-class VideoCheckpointCallback(CheckpointCallback):
-    """
-    Callback for saving a model checkpoint and recording/logging a video.
-    It extends the CheckpointCallback to also trigger video recording
-    at specified intervals (multiples of checkpoint frequency).
+    A custom runner that inherits from RSL-RL's OnPolicyRunner to add
+    periodic video recording and logging to Weights & Biases.
     """
 
-    def __init__(self,
-                 save_freq: int,
-                 save_path: str,
-                 name_prefix: str = "rl_model",
-                 video_log_freq_multiplier: int = 1,
-                 video_length: int = 200,
-                 video_fps: int = 30,
-                 verbose: int = 0,
-                 wandb_run: Optional[WandbRun] = None):
-        super().__init__(save_freq=save_freq, save_path=save_path,
-                         name_prefix=name_prefix, verbose=verbose)
-        self.video_length = video_length
-        self.video_fps = video_fps
-        self.wandb_run = wandb_run
-        self.video_log_freq_multiplier = max(1, video_log_freq_multiplier)
-        self.checkpoint_count = 0
+    def __init__(self, env, train_cfg: 'TrainConfig', log_dir, device='cpu'):
+        """
+        Initializes the custom runner.
 
-    def _on_step(self) -> bool:
-        continue_training = super()._on_step()
-        if not continue_training:
-            return False
+        This method bridges the gap between the script's dataclass-based configuration
+        and the RSL-RL runner's expectation of a dictionary-based configuration.
 
-        if self.num_timesteps > 0 and self.num_timesteps % self.save_freq == 0:
-            self.checkpoint_count += 1
+        Args:
+            env: The vectorized environment to train on.
+            train_cfg: The master configuration object (a TrainConfig dataclass).
+            log_dir: The directory to save logs and checkpoints.
+            device: The device to run the training on ('cpu' or 'cuda').
+        """
+        # RSL-RL's OnPolicyRunner expects a dictionary where runner parameters are at the top level,
+        # and policy/algorithm parameters are in nested dictionaries. We manually construct this
+        # dictionary from our dataclass structure to ensure correctness.
 
-            if self.checkpoint_count % self.video_log_freq_multiplier == 0:
-                if self.verbose > 0:
-                    print(
-                        f"Saving model checkpoint and recording video at timestep {self.num_timesteps}")
+        # Start with the nested dictionaries for policy and algorithm
+        runner_internal_cfg = {
+            "policy": asdict(train_cfg.policy),
+            "algorithm": asdict(train_cfg.algorithm)
+        }
+        # Add all fields from the RunnerConfig dataclass to the top level of the dictionary.
+        # This will include 'wandb_entity' and 'wandb_project', which are needed by WandbSummaryWriter.
+        for f in fields(train_cfg.runner):
+            runner_internal_cfg[f.name] = getattr(
+                train_cfg.runner, f.name)
 
-                video_filename = f"{self.name_prefix}_{self.num_timesteps}_video.mp4"
-                video_save_dir = os.path.join(self.save_path, "videos")
-                os.makedirs(video_save_dir, exist_ok=True)
+        # Call the parent constructor with the explicitly constructed dictionary
+        super().__init__(env, runner_internal_cfg, log_dir, device)
 
-                actual_env_for_video = self.training_env.venv if hasattr(
-                    self.training_env, 'venv') else self.training_env
+        # Store the original dataclass config for convenient access in this custom class
+        self.full_cfg = train_cfg
 
-                if not hasattr(actual_env_for_video, 'start_video_recording') or \
-                   not hasattr(actual_env_for_video, 'stop_video_recording'):
-                    if self.verbose > 0:
-                        print("Video recording methods not found on the environment.")
-                    return True
+        # Now, access video settings from the stored dataclass config
+        self.video_log_interval = self.full_cfg.runner.video_log_interval
+        self.video_length = self.full_cfg.runner.video_length
+        self.last_video_log_time = 0
 
-                if not actual_env_for_video.start_video_recording(env_idx_to_focus=0):
-                    if self.verbose > 0:
-                        print("Failed to start video recording in environment.")
-                    return True
+    def log_video(self, it):
+        """
+        Records and logs a video of the policy interacting with the environment.
+        """
+        if not self.writer or not hasattr(self.env, 'start_video_recording'):
+            return
 
-                if self.verbose > 0:
-                    print(
-                        f"Running dedicated episode for video recording (length {self.video_length})...")
+        print("--- Recording video ---")
+        video_name = f'iteration_{it}.mp4'
+        video_path = os.path.join(self.log_dir, video_name)
 
-                obs_for_video_predict = self.training_env.buf_obs if hasattr(
-                    self.training_env, 'buf_obs') else self.training_env.reset()
+        # Start recording
+        self.env.start_video_recording()
 
-                ep_rewards_video = []
-                dones_video = np.array([False] * self.training_env.num_envs)
+        # Run a short episode for the video
+        obs, infos = self.env.get_observations()
+        critic_obs = infos.get("observations", {}).get("critic", obs)
+        for _ in range(self.video_length):
+            with torch.no_grad():
+                actions = self.alg.act(obs, critic_obs)
+            obs, privileged_obs, rews, dones, infos = self.env.step(actions)
+            critic_obs = infos.get("observations", {}).get("critic", obs)
 
-                for _ in range(self.video_length):
-                    if dones_video[0]:
-                        break
-                    all_actions, _ = self.model.predict(
-                        obs_for_video_predict, deterministic=True)
-                    next_obs_dict, rewards, dones_step, infos = self.training_env.step(
-                        all_actions)
-                    obs_for_video_predict = next_obs_dict
-                    ep_rewards_video.append(rewards[0])
-                    dones_video = dones_step
+        # Stop recording and save the video
+        self.env.stop_video_recording(video_path)
+        print(f"--- Video saved to {video_path} ---")
 
-                video_file_path = actual_env_for_video.stop_video_recording(
-                    save_dir=video_save_dir, filename=video_filename, fps=self.video_fps)
-
-                if video_file_path and self.wandb_run:
-                    try:
-                        log_payload = {
-                            f"media/training_video_step": wandb.Video(video_file_path, fps=self.video_fps, format="mp4"),
-                            f"diagnostics/video_ep_mean_reward_env0_step": safe_mean(ep_rewards_video) if ep_rewards_video else 0
-                        }
-                        self.wandb_run.log(
-                            log_payload, step=self.num_timesteps)
-                        if self.verbose > 0:
-                            print(f"Logged video {video_file_path} to W&B.")
-                    except Exception as e:
-                        if self.verbose > 0:
-                            print(f"Error logging video to W&B: {e}")
-        return True
-
-
-def setup_wandb(project_name: Optional[str], entity: Optional[str], config: Dict[str, Any],
-                monitor_gym: bool = True, save_code: bool = True) -> Optional[WandbRun]:
-    """ 
-    Sets up Weights & Biases for experiment tracking.
-    Handles login and initialization of a W&B run.
-    """
-    if not project_name:
-        print("W&B project name not provided. Skipping W&B setup.")
-        return None
-
-    run: Optional[WandbRun] = None
-    try:
-        wandb.login()
-    except Exception:
+        # Log video
         try:
-            print("W&B login failed. Please enter your W&B API key.")
-            key = getpass.getpass(
-                prompt="Enter your W&B API key (or press Enter to skip W&B): ")
-            if key:
-                os.environ["WANDB_API_KEY"] = key
-                wandb.login()
+            # Check logger type to use the correct logging method
+            if isinstance(self.writer, WandbSummaryWriter):
+                # W&B can log video directly from a path
+                wandb.log({"policy_rollout": wandb.Video(
+                    video_path, fps=30, format="mp4")}, step=it)
+                print("--- Logged video to W&B ---")
+            else:  # Default to Tensorboard SummaryWriter
+                # Tensorboard needs the video as a tensor
+                video_reader = imageio.get_reader(video_path)
+                fps = video_reader.get_meta_data()['fps']
+                # From (T, H, W, C) to (N, T, C, H, W) where N=1
+                video_frames = np.array([frame for frame in video_reader])
+                video_tensor = torch.from_numpy(
+                    video_frames).permute(0, 3, 1, 2).unsqueeze(0)
+                self.writer.add_video(
+                    tag="policy_rollout", vid_tensor=video_tensor, global_step=it, fps=fps)
+                print("--- Logged video to Tensorboard ---")
+        except Exception as e:
+            print(f"Error logging video: {e}")
+
+    def get_inference_policy(self, device=None):
+        self.alg.actor_critic.eval()
+        return self.alg.actor_critic.act_inference
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        """
+        Overrides the main learn method to add video logging and correct timing.
+        """
+        # Initialize writer
+        if self.log_dir is not None and self.writer is None:
+            self.logger_type = self.cfg.get("logger", "tensorboard").lower()
+            if self.logger_type == "wandb":
+                # The W&B run is already initialized. WandbSummaryWriter's init will
+                # just grab the existing run object.
+                self.writer = WandbSummaryWriter(
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+            elif self.logger_type == "tensorboard":
+                self.writer = SummaryWriter(log_dir=self.log_dir)
             else:
-                print("No W&B API key entered. Skipping W&B.")
-                return None
-        except Exception as e:
-            print(
-                f"Error during W&B login with manual key: {e}. Skipping W&B.")
-            return None
+                raise ValueError(
+                    f"Logger type {self.logger_type} not supported")
 
-    try:
-        run = wandb.init(
-            project=project_name,
-            entity=entity,
-            config=config,
-            sync_tensorboard=True,
-            monitor_gym=monitor_gym,
-            save_code=save_code
-        )
-        print(
-            f"W&B run initialized successfully. Run URL: {run.url if run else 'N/A'}")
-    except Exception as e:
-        print(f"Error initializing W&B run: {e}. Proceeding without W&B.")
-        run = None
-    return run
+        if hasattr(self, 'fixed_games_to_play') and self.fixed_games_to_play is not None:
+            self.env.start_recording()
+
+        obs, infos = self.env.get_observations()
+        critic_obs = infos.get("observations", {}).get("critic", obs)
+
+        self.alg.actor_critic.train()
+
+        # Bookkeeping for logging, mirrored from the base runner
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(
+            self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(
+            self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Expanded list of reward components to log
+        reward_component_names = [
+            "distance", "success", "action_penalty", "joint_limit_penalty",
+            "collision_penalty", "accel_penalty", "upright_bonus",
+            "jerk_penalty", "joint_velocity_penalty", "ee_velocity_penalty"
+        ]
+        reward_component_buffers = {name: deque(
+            maxlen=100) for name in reward_component_names}
+        current_reward_component_sums = {
+            name: torch.zeros(self.env.num_envs,
+                              dtype=torch.float, device=self.device)
+            for name in reward_component_names
+        }
+
+        start_iter = self.current_learning_iteration
+        # Define tot_iter for the logging function
+        tot_iter = start_iter + num_learning_iterations
+        tot_time = 0
+
+        for it in range(start_iter, tot_iter):
+            # --- Data Collection Phase ---
+            collection_start = time.time()
+
+            # List to store episode lengths from the current iteration
+            iteration_episode_lengths = []
+
+            with torch.inference_mode():
+                # Rollout over the environment
+                for i in range(self.num_steps_per_env):
+                    actions = self.alg.act(obs, critic_obs)
+                    obs, privileged_obs, rews, dones, infos = self.env.step(
+                        actions)
+                    critic_obs = infos.get(
+                        "observations", {}).get("critic", obs)
+                    self.alg.process_env_step(rews, dones, infos)
+
+                    # Update standard and custom reward/length buffers
+                    cur_reward_sum += rews
+                    cur_episode_length += 1
+                    for name in reward_component_names:
+                        if f"reward_components/{name}" in infos:
+                            current_reward_component_sums[
+                                name] += infos[f"reward_components/{name}"]
+
+                    new_ids = (dones > 0).nonzero(as_tuple=False)
+                    if new_ids.numel() > 0:
+                        # Get lengths of episodes that just finished in this step
+                        finished_lengths = cur_episode_length[new_ids][:, 0].cpu(
+                        ).numpy().tolist()
+                        iteration_episode_lengths.extend(finished_lengths)
+
+                        # Update main buffers for the base logger and smoothed stats
+                        rewbuffer.extend(
+                            cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(finished_lengths)
+
+                        # Reset buffers for these envs
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+
+                        for name, sums in current_reward_component_sums.items():
+                            reward_component_buffers[name].extend(
+                                sums[new_ids][:, 0].cpu().numpy().tolist())
+                            sums[new_ids] = 0
+
+                # Check for video logging interval during collection
+                if self.video_log_interval > 0 and (it % self.video_log_interval == 0):
+                    self.log_video(it)
+
+                # Compute returns before learning
+                self.alg.compute_returns(critic_obs)
+
+            collection_time = time.time() - collection_start
+
+            # --- Learning Phase ---
+            learn_start = time.time()
+            # Unpack all 5 values returned by update to prevent future KeyErrors
+            mean_value_loss, mean_surrogate_loss, mean_entropy, mean_rnd_loss, mean_symmetry_loss = self.alg.update()
+            learn_time = time.time() - learn_start
+
+            # Set current iteration for logging and saving
+            self.current_learning_iteration = it
+
+            # Retrieve episode infos before logging
+            ep_infos = self.env.get_episode_infos()
+
+            # Base logging from the parent class
+            if self.log_dir is not None:
+                self.log(locals())
+
+            # --- Custom detailed logging ---
+            if self.log_dir is not None and self.writer is not None:
+                # Explained variance
+                explained_var = 1 - torch.var(self.alg.storage.values -
+                                              self.alg.storage.returns) / torch.var(self.alg.storage.returns)
+                self.writer.add_scalar(
+                    "Train/explained_variance", explained_var.item(), it)
+
+                # KL divergence (if available from storage)
+                if hasattr(self.alg.storage, 'kl'):
+                    mean_kl = self.alg.storage.kl.mean()
+                    self.writer.add_scalar(
+                        "Train/kl_divergence", mean_kl.item(), it)
+
+                # Log individual reward components
+                for name, buffer in reward_component_buffers.items():
+                    if len(buffer) > 0:
+                        self.writer.add_scalar(
+                            f"Rewards/{name}", statistics.mean(buffer), it)
+
+                # Log episode length stats from the current iteration only
+                if iteration_episode_lengths:
+                    self.writer.add_scalar(
+                        "Rollout/length_min", min(iteration_episode_lengths), it)
+                    self.writer.add_scalar(
+                        "Rollout/length_mean", statistics.mean(iteration_episode_lengths), it)
+                    self.writer.add_scalar(
+                        "Rollout/length_max", max(iteration_episode_lengths), it)
+
+                # Log curriculum-related info from the env's `extras` dict
+                for key, value in infos.items():
+                    if "curriculum/" in key:
+                        log_name = "Curriculum/" + \
+                            key.split('/')[1].replace('_', ' ').title()
+                        self.writer.add_scalar(log_name, value.item(), it)
+                    if "debug/" in key:
+                        log_name = "Debug/" + \
+                            key.split('/')[1].replace('_', ' ').title()
+                        self.writer.add_scalar(
+                            log_name, value.mean().item(), it)
+
+            # Checkpoint saving
+            if self.save_interval > 0 and (it % self.save_interval == 0):
+                self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
+
+            tot_time += collection_time + learn_time
+
+        # Save final model
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(
+            self.current_learning_iteration)))
 
 
-def create_env_config(training_config: Dict[str, Any]) -> Dict[str, Any]:
-    """ 
-    Creates the configuration dictionary specifically for initializing FrankaShelfEnv.
-    Extracts relevant parameters from the main training_config.
+@dataclass
+class EnvConfig:
+    """Configuration for the FrankaShelfEnv environment."""
+    num_envs: int = 3072
+    num_obs: int = 45  # (7*2 + 3+4) + 3 + 6 + (7*2)
+    num_privileged_obs: int = 0
+    num_actions: int = 7
+    max_episode_length: int = 600
+    seed: int = 42
+
+    # --- Control and Simulation Parameters ---
+    control_mode: str = 'torque'  # 'velocity' or 'torque'
+    dt: float = 0.005
+    num_actions_history: int = 2  # Corresponds to part of num_obs
+
+    # --- Base Reward Coefficients (placeholders, will be overridden) ---
+    k_dist_reward: float = 0.0
+    k_joint_limit_penalty: float = 0.0
+    k_collision_penalty: float = 0.0
+    success_reward_val: float = 300.0
+    min_episode_length_for_success_metric: int = 10
+
+    # --- Proximity-based velocity penalty ---
+    # How much to scale penalty at dist=0
+    proximity_vel_penalty_max_scale: float = 1.0
+    proximity_vel_penalty_dist_threshold: float = 0.05  # Dist at which scaling starts
+
+    # Modular Curriculum Configurations (placeholders)
+    threshold_curriculum: CurriculumConfig = field(default_factory=dict)
+    joint_velocity_penalty_curriculum: CurriculumConfig = field(
+        default_factory=dict)
+    ee_velocity_penalty_curriculum: CurriculumConfig = field(
+        default_factory=dict)
+    action_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    accel_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    jerk_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    upright_bonus_curriculum: CurriculumConfig = field(default_factory=dict)
+
+    def __post_init__(self):
+        """
+        Dynamically sets reward coefficients and curricula based on the selected control mode.
+        """
+        if self.control_mode == 'velocity':
+            self.k_dist_reward = 2.0
+            self.k_joint_limit_penalty = 5.0
+            self.k_collision_penalty = 20.0
+
+            # For velocity control, penalties are constant and there is no upright bonus.
+            self.action_penalty_curriculum = CurriculumConfig(
+                start_value=0.0005, end_value=0.0005, start_metric_val=0.0, end_metric_val=1.0)
+            self.accel_penalty_curriculum = CurriculumConfig(
+                start_value=0.0001, end_value=0.0001, start_metric_val=0.0, end_metric_val=1.0)
+            self.jerk_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.0, start_metric_val=0.0, end_metric_val=1.0)
+            self.joint_velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.0, start_metric_val=0.0, end_metric_val=1.0)
+            self.ee_velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.0, start_metric_val=0.0, end_metric_val=1.0)
+            self.upright_bonus_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.0, start_metric_val=0.0, end_metric_val=1.0)
+            self.threshold_curriculum = CurriculumConfig(
+                start_value=0.05, end_value=0.005, start_metric_val=0.7, end_metric_val=0.9)
+
+        elif self.control_mode == 'torque':
+            self.k_dist_reward = 2.5
+            self.k_joint_limit_penalty = 5.0
+            self.k_collision_penalty = 20.0
+
+            # For torque control, penalties and bonuses are gradually introduced/removed.
+            self.action_penalty_curriculum = CurriculumConfig(
+                start_value=1.0e-4, end_value=1.0e-3, start_metric_val=0.0, end_metric_val=0.2)
+            self.accel_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=1.0e-6, start_metric_val=0.4, end_metric_val=0.6)
+            self.jerk_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=1.0e-12, start_metric_val=0.7, end_metric_val=0.8)
+            self.joint_velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
+            self.ee_velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
+            self.upright_bonus_curriculum = CurriculumConfig(
+                start_value=1.0, end_value=0.0, start_metric_val=0.0, end_metric_val=0.4)
+            self.threshold_curriculum = CurriculumConfig(
+                start_value=0.05, end_value=0.005, start_metric_val=0.5, end_metric_val=0.84)
+
+    include_shelf: bool = False
+    randomize_shelf_config: bool = True
+    workspace_bounds_xyz: tuple = ((-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5))
+    video_camera_pos: tuple = (1.8, -1.8, 2.0)
+    video_camera_lookat: tuple = (0.3, 0.0, 0.5)
+    video_camera_fov: float = 45
+    video_res: tuple = (960, 640)
+
+
+@dataclass
+class PolicyConfig:
+    """Configuration for the Actor-Critic policy network."""
+    class_name: str = 'ActorCritic'
+    actor_hidden_dims: list = None
+    critic_hidden_dims: list = None
+    activation: str = 'elu'
+    init_noise_std: float = 1.0
+
+    def __post_init__(self):
+        if self.actor_hidden_dims is None:
+            self.actor_hidden_dims = [512, 256, 128]
+        if self.critic_hidden_dims is None:
+            self.critic_hidden_dims = [512, 512, 256]
+
+
+@dataclass
+class AlgorithmConfig:
+    """Configuration for the PPO algorithm."""
+    class_name: str = 'PPO'
+    value_loss_coef: float = 0.5
+    use_clipped_value_loss: bool = True
+    clip_param: float = 0.2
+    entropy_coef: float = 0.0015
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-3
+    schedule: str = "adaptive"
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float = 0.01
+    max_grad_norm: float = 1.0
+
+
+@dataclass
+class RunnerConfig:
+    """Configuration for the RSL-RL OnPolicyRunner."""
+    # --- General ---
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    seed: int = 42
+    max_iterations: int = 4001
+
+    # --- Runner-specific parameters for RSL-RL ---
+    empirical_normalization: bool = True
+    num_steps_per_env: int = 24
+    logger: str = "wandb"
+
+    # --- Logging and Saving ---
+    log_dir: str = "./training_logs/rsl_ppo_franka/"
+    run_name: str = ""  # If empty, a unique name will be generated
+    experiment_name: str = "trajectory-tracking-franka"
+    save_interval: int = 100  # in iterations
+    checkpoint_path: str = ""  # path to checkpoint
+
+    # --- Video Logging ---
+    video_log_interval: int = 250
+    video_length: int = 600
+
+    # --- W&B Integration ---
+    wandb: bool = True
+    wandb_project: str = "franka-trajectory-tracking"
+    wandb_entity: str = None  # Set to None to be fetched automatically
+    wandb_group: str = ""
+    wandb_tags: list = None
+
+    def __post_init__(self):
+        if self.wandb_tags is None:
+            self.wandb_tags = ["rsl_rl", "franka",
+                               "reach", "trajectory-tracking"]
+
+
+@dataclass
+class TrainConfig:
+    """Top-level configuration container."""
+    env: EnvConfig = EnvConfig()
+    policy: PolicyConfig = PolicyConfig()
+    runner: RunnerConfig = RunnerConfig()
+    algorithm: AlgorithmConfig = AlgorithmConfig()
+
+
+def run_franka_training(cfg: TrainConfig) -> None:
     """
-    return dict(
-        render_mode=None,
-        num_envs=training_config["num_genesis_envs"],
-        workspace_bounds_xyz=tuple(training_config.get(
-            'workspace_bounds_xyz_override', ((-1.5, 1.5), (-1.5, 1.5), (0.0, 3.0)))),
-        k_dist_reward=training_config.get('k_dist_reward'),
-        k_time_penalty=training_config.get('k_time_penalty'),
-        k_action_penalty=training_config.get('k_action_penalty'),
-        k_joint_limit_penalty=training_config.get('k_joint_limit_penalty'),
-        k_collision_penalty=training_config.get('k_collision_penalty'),
-        k_accel_penalty=training_config.get('k_accel_penalty'),
-        success_reward_val=training_config.get('success_reward_val'),
-        success_threshold_val=training_config.get('success_threshold_val'),
-        max_steps_per_episode=training_config.get('max_steps_per_episode'),
-        video_camera_pos=tuple(training_config.get(
-            'video_camera_pos_override')),
-        video_camera_lookat=tuple(training_config.get(
-            'video_camera_lookat_override')),
-        video_camera_fov=training_config.get('video_camera_fov_override'),
-        video_res=tuple(training_config.get('video_res_override')),
-        include_shelf=training_config.get('include_shelf', True),
-        randomize_shelf_config=training_config.get(
-            'randomize_shelf_config', True)
-    )
-
-
-def create_training_env(num_genesis_envs: int, seed: int, env_kwargs: Dict[str, Any], gamma: float) -> VecNormalize:
-    """ 
-    Creates the FrankaShelfEnv, seeds it, and wraps it with VecNormalize.
-    """
-    try:
-        env = FrankaShelfEnv(**env_kwargs)
-        env.seed(seed)
-    except Exception as e:
-        print(f"CRITICAL ERROR: Failed to create FrankaShelfEnv: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-
-    if not (hasattr(env, 'num_envs') and hasattr(env, 'observation_space') and hasattr(env, 'action_space') and
-            callable(getattr(env, 'reset', None)) and callable(getattr(env, 'step_async', None)) and
-            callable(getattr(env, 'step_wait', None))):
-        print("CRITICAL ERROR: Created environment does not conform to VecEnv interface.")
-        sys.exit(1)
-
-    if env.num_envs != num_genesis_envs:
-        print(
-            f"Warning: FrankaShelfEnv num_envs ({env.num_envs}) differs from requested num_genesis_envs ({num_genesis_envs}).")
-
-    normalized_env = VecNormalize(
-        env,
-        norm_obs=True,
-        norm_reward=True,
-        gamma=gamma
-    )
-    return normalized_env
-
-
-def create_ppo_model(config: Dict[str, Any], env: VecNormalize,
-                     policy_kwargs: Optional[Dict[str, Any]], log_dir: str,
-                     wandb_run: Optional[WandbRun] = None) -> PPO:
-    """ 
-    Creates and returns a PPO agent from Stable Baselines3.
-    """
-    model = PPO(
-        policy=config["policy_type"],
-        env=env,
-        verbose=1,
-        tensorboard_log=log_dir,
-        seed=config["seed"],
-        gamma=config["gamma"],
-        gae_lambda=config["gae_lambda"],
-        n_steps=config["n_steps_ppo"],
-        batch_size=config["batch_size_ppo"],
-        n_epochs=config["n_epochs_ppo"],
-        learning_rate=config["learning_rate"],
-        clip_range=config["clip_range"],
-        ent_coef=config["ent_coef"],
-        vf_coef=config["vf_coef"],
-        max_grad_norm=config["max_grad_norm"],
-        policy_kwargs=policy_kwargs
-    )
-    return model
-
-
-def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
-                     log_dir: str, model_save_path_base: str,
-                     wandb_run_instance: Optional[WandbRun]) -> List[BaseCallback]:
-    """ 
-    Creates a list of callbacks for training, including checkpointing, evaluation, and W&B logging.
-    """
-    callbacks = []
-
-    samples_per_ppo_rollout = model.n_steps * model.n_envs
-
-    checkpoint_save_freq_steps = samples_per_ppo_rollout * \
-        config["checkpoint_save_freq_rollouts"]
-    eval_freq_steps = samples_per_ppo_rollout * config["eval_freq_rollouts"]
-
-    video_checkpoint_cb = VideoCheckpointCallback(
-        save_freq=checkpoint_save_freq_steps,
-        save_path=log_dir,
-        name_prefix=f"{os.path.basename(model_save_path_base)}_ckpt",
-        video_log_freq_multiplier=config["video_log_freq_multiplier"],
-        video_length=config["video_length"],
-        video_fps=config["video_fps"],
-        wandb_run=wandb_run_instance,
-        verbose=1
-    )
-    callbacks.append(video_checkpoint_cb)
-
-    eval_callback = EvalCallback(
-        eval_env=eval_env,
-        best_model_save_path=os.path.join(log_dir, "best_model"),
-        log_path=log_dir,
-        eval_freq=eval_freq_steps,
-        n_eval_episodes=max(5 * eval_env.num_envs // 2,
-                            eval_env.num_envs if eval_env.num_envs > 0 else 5),
-        deterministic=True,
-        render=False,
-        verbose=1
-    )
-    callbacks.append(eval_callback)
-
-    # MOD: Add the new WandbDetailedMetricsCallback
-    if wandb_run_instance:
-        detailed_metrics_cb = WandbDetailedMetricsCallback(
-            wandb_run_instance=wandb_run_instance, verbose=1)
-        callbacks.append(detailed_metrics_cb)
-
-        # The original WandbCallbackSB3 can still be used for its other logging features
-        # (model checkpoints to W&B, default SB3 logger metrics, etc.)
-        wandb_sb3_callback = WandbCallbackSB3(
-            model_save_path=os.path.join(
-                log_dir, f"wandb_models/{wandb_run_instance.id}"),
-            model_save_freq=samples_per_ppo_rollout *
-            config.get("wandb_model_save_freq_rollouts", 0),
-            gradient_save_freq=samples_per_ppo_rollout *
-            config.get("wandb_model_save_freq_rollouts", 0),
-            log="all",  # This will continue to log SB3 default logger content
-            verbose=2
-        )
-        callbacks.append(wandb_sb3_callback)
-
-    return callbacks
-
-
-def train_and_save_model(model: PPO, config: Dict[str, Any], callbacks: List[BaseCallback],
-                         model_save_path_base: str, env: VecNormalize, log_dir: str,
-                         wandb_run_instance: Optional[WandbRun]) -> None:
-    """ 
-    Runs the main training loop and handles final model and VecNormalize stats saving.
-    Also logs artifacts to W&B if enabled.
-    """
-    try:
-        model.learn(
-            total_timesteps=config["total_timesteps"],
-            callback=callbacks,
-            progress_bar=True
-        )
-    except Exception as e:
-        print(f"Error during model training: {e}")
-        traceback.print_exc()
-    finally:
-        save_dir = os.path.dirname(model_save_path_base) if os.path.dirname(
-            model_save_path_base) else log_dir
-        final_model_name_stem = os.path.basename(model_save_path_base)
-        os.makedirs(save_dir, exist_ok=True)
-
-        full_final_model_path = os.path.join(
-            save_dir, f"{final_model_name_stem}_final.zip")
-        model.save(full_final_model_path)
-        print(f"Final model saved to {full_final_model_path}")
-
-        vec_normalize_stats_path = os.path.join(
-            save_dir, f"{final_model_name_stem}_vecnormalize.pkl")
-        if isinstance(env, VecNormalize):
-            env.save(vec_normalize_stats_path)
-            print(f"VecNormalize stats saved to {vec_normalize_stats_path}")
-
-        if wandb_run_instance:
-            try:
-                trained_model_artifact = wandb.Artifact(
-                    name=f'{final_model_name_stem}_final_model', type='model')
-                trained_model_artifact.add_file(full_final_model_path)
-                wandb_run_instance.log_artifact(trained_model_artifact)
-                print(
-                    f"Logged final model to W&B: {trained_model_artifact.name}")
-
-                if isinstance(env, VecNormalize) and os.path.exists(vec_normalize_stats_path):
-                    vec_stats_artifact = wandb.Artifact(
-                        name=f'{final_model_name_stem}_vecnormalize_stats', type='dataset')
-                    vec_stats_artifact.add_file(vec_normalize_stats_path)
-                    wandb_run_instance.log_artifact(vec_stats_artifact)
-                    print(
-                        f"Logged VecNormalize stats to W&B: {vec_stats_artifact.name}")
-            except Exception as e:
-                print(f"Error logging final artifacts to W&B: {e}")
-
-
-def cleanup_training(env: Optional[VecNormalize], wandb_run_instance: Optional[WandbRun]) -> None:
-    """ 
-    Performs cleanup operations after training, such as closing the environment
-    and finishing the W&B run.
-    """
-    if env:
-        try:
-            env.close()
-            print("Training environment closed.")
-        except Exception as e:
-            print(f"Error closing environment: {e}")
-
-    if wandb_run_instance:
-        try:
-            wandb_run_instance.finish()
-            print("W&B run finished.")
-        except Exception as e:
-            print(f"Error finishing W&B run: {e}")
-
-
-def run_franka_training(training_config: Dict[str, Any]) -> None:
-    """ 
     Main orchestrator for the Franka agent training process.
-    Initializes Genesis, sets up W&B, creates environment and agent,
-    manages training, and handles cleanup.
+
+    :param cfg: A TrainConfig object containing all configuration parameters.
     """
     gs_initialized_locally = False
-    train_env_instance: Optional[VecNormalize] = None
-    wandb_run: Optional[WandbRun] = None
+    env = None
+    wandb_run = None
 
     try:
+        # --- Handle W&B Login, config, and Initialization ---
+        if cfg.runner.wandb:
+            try:
+                # Ensure user is logged in to W&B
+                if wandb.api.api_key is None:
+                    wandb.login()
+
+                # Fetch the default entity from the W&B API if not provided
+                if cfg.runner.wandb_entity is None:
+                    api = wandb.Api()
+                    default_entity = api.default_entity
+                    if default_entity:
+                        print(
+                            f"--- W&B entity not provided, using default: {default_entity} ---")
+                        cfg.runner.wandb_entity = default_entity
+                    else:
+                        raise ValueError(
+                            "Could not determine W&B default entity. Please set it manually in the config.")
+
+                # Initialize the W&B run here to ensure it's done correctly before the runner starts
+                wandb_run = wandb.init(
+                    project=cfg.runner.wandb_project,
+                    entity=cfg.runner.wandb_entity,
+                    group=cfg.runner.wandb_group or None,
+                    name=cfg.runner.run_name or None,
+                    tags=cfg.runner.wandb_tags,
+                    config=asdict(cfg)  # Log the entire configuration
+                )
+
+            except Exception as e:
+                print(f"--- W&B setup failed: {e}. Disabling W&B logging. ---")
+                cfg.runner.wandb = False
+                if wandb_run:
+                    wandb_run.finish()
+
+        # --- Initialize Genesis ---
         if not (hasattr(gs, '_is_initialized') and gs._is_initialized):
-            backend_to_use = gs.gpu if torch.cuda.is_available() else gs.cpu
             print(
-                f"Initializing Genesis with backend: {'GPU' if backend_to_use == gs.gpu else 'CPU'}")
+                f"Initializing Genesis with backend: {cfg.runner.device.upper()}")
+            backend_to_use = gs.gpu if cfg.runner.device == 'cuda' else gs.cpu
             gs.init(backend=backend_to_use)
             gs_initialized_locally = True
             print("Genesis initialized successfully.")
 
-        set_random_seed(training_config["seed"])
-        print(f"Random seed set to: {training_config['seed']}")
+        # --- Create Environment ---
+        env_kwargs = {
+            "num_envs": cfg.env.num_envs,
+            "max_steps_per_episode": cfg.env.max_episode_length,
+            "control_mode": cfg.env.control_mode,
+            "dt": cfg.env.dt,
+            "device": cfg.runner.device,
+            "seed": cfg.env.seed,
+            "include_shelf": cfg.env.include_shelf,
+            "randomize_shelf_config": cfg.env.randomize_shelf_config,
+            # Observation Space
+            "num_actions_history": cfg.env.num_actions_history,
+            # Rewards & Curricula
+            "k_dist_reward": cfg.env.k_dist_reward,
+            "k_joint_limit_penalty": cfg.env.k_joint_limit_penalty,
+            "k_collision_penalty": cfg.env.k_collision_penalty,
+            "success_reward_val": cfg.env.success_reward_val,
+            "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,
+            "proximity_vel_penalty_max_scale": cfg.env.proximity_vel_penalty_max_scale,
+            "proximity_vel_penalty_dist_threshold": cfg.env.proximity_vel_penalty_dist_threshold,
+            "threshold_curriculum_cfg": asdict(cfg.env.threshold_curriculum),
+            "joint_velocity_penalty_curriculum_cfg": asdict(cfg.env.joint_velocity_penalty_curriculum),
+            "ee_velocity_penalty_curriculum_cfg": asdict(cfg.env.ee_velocity_penalty_curriculum),
+            "action_penalty_curriculum_cfg": asdict(cfg.env.action_penalty_curriculum),
+            "accel_penalty_curriculum_cfg": asdict(cfg.env.accel_penalty_curriculum),
+            "jerk_penalty_curriculum_cfg": asdict(cfg.env.jerk_penalty_curriculum),
+            "upright_bonus_curriculum_cfg": asdict(cfg.env.upright_bonus_curriculum),
+        }
+        env = FrankaShelfEnv(**env_kwargs)
+        print("FrankaShelfEnv created successfully.")
 
-        wandb_run = setup_wandb(
-            project_name=training_config.get("wandb_project_name"),
-            entity=training_config.get("wandb_entity"),
-            config=training_config
+        # --- Create Log Directory ---
+        os.makedirs(cfg.runner.log_dir, exist_ok=True)
+
+        # --- Instantiate and Run CustomOnPolicyRunner ---
+        runner = CustomOnPolicyRunner(
+            env, cfg, cfg.runner.log_dir, device=cfg.runner.device)
+        print("CustomOnPolicyRunner instantiated. Starting training...")
+
+        runner.learn(
+            num_learning_iterations=cfg.runner.max_iterations,
+            init_at_random_ep_len=True
         )
-
-        log_dir = training_config["log_dir"]
-        model_save_path_base = training_config["model_save_path"]
-        os.makedirs(log_dir, exist_ok=True)
-        if os.path.dirname(model_save_path_base):
-            os.makedirs(os.path.dirname(model_save_path_base), exist_ok=True)
-        print(f"Log directory: {log_dir}")
-        print(f"Base model save path: {model_save_path_base}")
-
-        env_specific_config = create_env_config(training_config)
-        if wandb_run:
-            wandb_env_config_to_log = {
-                f"env_{k}": v for k, v in env_specific_config.items() if k not in training_config}
-            if wandb_env_config_to_log:
-                wandb_run.config.update(wandb_env_config_to_log,
-                                        allow_val_change=True)
-
-        train_env_instance = create_training_env(
-            num_genesis_envs=training_config["num_genesis_envs"],
-            seed=training_config["seed"],
-            env_kwargs=env_specific_config,
-            gamma=training_config["gamma"]
-        )
-        print("Training environment created and normalized.")
-
-        policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
-        print(f"Using policy_kwargs: {policy_kwargs}")
-
-        ppo_model = create_ppo_model(
-            config=training_config,
-            env=train_env_instance,
-            policy_kwargs=policy_kwargs,
-            log_dir=log_dir,
-            wandb_run=wandb_run
-        )
-        print(
-            f"PPO model created with policy: {training_config['policy_type']}")
-
-        training_callbacks = create_callbacks(
-            config=training_config, model=ppo_model, eval_env=train_env_instance,
-            log_dir=log_dir, model_save_path_base=model_save_path_base,
-            wandb_run_instance=wandb_run
-        )
-        print(f"Created {len(training_callbacks)} callbacks for training.")
-
-        print("Starting model training...")
-        train_and_save_model(
-            model=ppo_model, config=training_config, callbacks=training_callbacks,
-            model_save_path_base=model_save_path_base, env=train_env_instance,
-            log_dir=log_dir, wandb_run_instance=wandb_run
-        )
-        print("Model training finished.")
+        print("Training finished.")
 
     except Exception as e:
         print(f"An unhandled exception occurred during training: {e}")
         traceback.print_exc()
+        sys.exit(1)
     finally:
         print("Performing cleanup...")
-        cleanup_training(train_env_instance, wandb_run)
+        if env is not None:
+            env.close()
+            print("Environment closed.")
+
+        # Ensure the W&B run is properly finished
+        if wandb_run:
+            wandb_run.finish()
+            print("W&B run finished.")
 
         if gs_initialized_locally and hasattr(gs, 'shutdown') and callable(gs.shutdown):
             try:
@@ -579,52 +604,5 @@ def run_franka_training(training_config: Dict[str, Any]) -> None:
 
 
 if __name__ == '__main__':
-    config_params = {
-        "policy_type": "MultiInputPolicy",
-        "seed": 42,
-        "gamma": 0.99,
-        "gae_lambda": 0.95,
-        "n_steps_ppo": 128,
-        "batch_size_ppo": 2048,
-        "n_epochs_ppo": 5,
-        "learning_rate": 3e-4,
-        "clip_range": 0.2,
-        "ent_coef": 0.001,
-        "vf_coef": 1.0,  # value function coefficient
-        "max_grad_norm": 0.5,
-        "total_timesteps": 100_000_000,
-        "num_genesis_envs": 1024,
-
-        "workspace_bounds_xyz_override": ((-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
-        "include_shelf": False,
-        "randomize_shelf_config": False,
-
-        "log_dir": "./training_logs/ppo_franka_shelf_params_obs/",
-        "model_save_path": "./training_logs/ppo_franka_shelf_params_obs/model_shelf_params",
-        "wandb_project_name": "FrankaPPO-ShelfParamsObs",
-        "wandb_entity": None,
-        "wandb_model_save_freq_rollouts": 5,
-
-        "checkpoint_save_freq_rollouts": 5,
-        "eval_freq_rollouts": 5,
-        "video_log_freq_multiplier": 3,
-        "video_length": 300,
-        "video_fps": 30,
-
-        "k_dist_reward": 20.0,
-        "k_time_penalty": 0.02,
-        "k_action_penalty": 0.005,
-        "k_joint_limit_penalty": 15.0,
-        "k_collision_penalty": 50.0,
-        "k_accel_penalty": 0.005,
-        "success_reward_val": 350.0,
-        "success_threshold_val": 0.05,
-        "max_steps_per_episode": 500,        # MODIFIED from 300
-
-        'video_camera_pos_override': (1.8, -1.8, 2.0),
-        'video_camera_lookat_override': (0.3, 0.0, 0.5),
-        'video_camera_fov_override': 45,
-        'video_res_override': (960, 640)
-    }
-
-    run_franka_training(training_config=config_params)
+    training_config = TrainConfig()
+    run_franka_training(training_config)

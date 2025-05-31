@@ -616,7 +616,7 @@ if __name__ == '__main__':
         "k_action_penalty": 0.005,
         "k_joint_limit_penalty": 15.0,
         "k_collision_penalty": 50.0,
-        "k_accel_penalty": 0.0001,
+        "k_accel_penalty": 0.00001,
         "success_reward_val": 350.0,
         "success_threshold_val": 0.05,
         "max_steps_per_episode": 500,        # MODIFIED from 300

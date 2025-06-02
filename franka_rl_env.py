@@ -658,7 +658,7 @@ class FrankaShelfEnv(VecEnv):
 
         actions_tensor = torch.tensor(
             scaled_targets, device=gs.device, dtype=torch.float32)
-        self.franka_entity.control_dofs_force(
+        self.franka_entity.control_dofs_velocity(
             actions_tensor, self.franka_arm_dof_indices_local)
         self.scene.step()
         if self._is_recording_active and self.video_capture_camera:
@@ -856,6 +856,7 @@ if __name__ == '__main__':
             for _ in range(30):
                 if env.scene:
                     env.scene.step()
+            env.reset()
 
         print("\nRunning a short loop with random actions...")
         for step_num in range(500):

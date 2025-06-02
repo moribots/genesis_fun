@@ -397,10 +397,8 @@ def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
         wandb_sb3_callback = WandbCallbackSB3(
             model_save_path=os.path.join(
                 log_dir, f"wandb_models/{wandb_run_instance.id}"),
-            model_save_freq=samples_per_ppo_rollout *
-            config.get("wandb_model_save_freq_rollouts", 0),
-            gradient_save_freq=samples_per_ppo_rollout *
-            config.get("wandb_model_save_freq_rollouts", 0),
+            model_save_freq=config.get("wandb_model_save_freq_rollouts", 0),
+            gradient_save_freq=config.get("wandb_model_save_freq_rollouts", 0),
             log="all",  # This will continue to log SB3 default logger content
             verbose=2
         )
@@ -584,13 +582,13 @@ if __name__ == '__main__':
         "seed": 42,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "n_steps_ppo": 32,
-        "batch_size_ppo": 64,
-        "n_epochs_ppo": 1,
+        "n_steps_ppo": 1024,
+        "batch_size_ppo": 12288,
+        "n_epochs_ppo": 4,
         "learning_rate": 3e-4,
         "clip_range": 0.2,
-        "ent_coef": 0.001,
-        "vf_coef": 1.0,  # value function coefficient
+        "ent_coef": 0.0001,
+        "vf_coef": 0.5,
         "max_grad_norm": 0.5,
         "total_timesteps": 100_000_000,
         "num_genesis_envs": 1024,
@@ -601,25 +599,26 @@ if __name__ == '__main__':
 
         "log_dir": "./training_logs/ppo_franka_shelf_params_obs/",
         "model_save_path": "./training_logs/ppo_franka_shelf_params_obs/model_shelf_params",
-        "wandb_project_name": "FrankaPPO-ShelfParamsObs",
+        "wandb_project_name": "FrankaPPO-Reach",
         "wandb_entity": None,
-        "wandb_model_save_freq_rollouts": 5,
+        "wandb_model_save_freq_rollouts": 1,
 
-        "checkpoint_save_freq_rollouts": 5,
-        "eval_freq_rollouts": 5,
-        "video_log_freq_multiplier": 3,
+        "checkpoint_save_freq_rollouts": 1,
+        "eval_freq_rollouts": 1,
+        "video_log_freq_multiplier": 5,
         "video_length": 300,
         "video_fps": 30,
 
-        "k_dist_reward": 50.0,
-        "k_time_penalty": 0.02,
-        "k_action_penalty": 0.005,
-        "k_joint_limit_penalty": 15.0,
-        "k_collision_penalty": 50.0,
-        "k_accel_penalty": 0.00001,
-        "success_reward_val": 350.0,
-        "success_threshold_val": 0.05,
-        "max_steps_per_episode": 500,        # MODIFIED from 300
+        # Reward coefficients
+        "k_dist_reward": 10.0,               # Distance reward (negative)
+        "k_time_penalty": 0.01,             # Per-step time penalty
+        "k_action_penalty": 0.001,          # Penalty for large actions
+        "k_joint_limit_penalty": 5.0,      # Penalty for being near joint limits
+        "k_collision_penalty": 20.0,        # Penalty for collisions
+        "k_accel_penalty": 0.0001,          # Penalty for high joint accelerations
+        "success_reward_val": 100.0,         # Reward for achieving success
+        "success_threshold_val": 0.05,      # Distance threshold for success
+        "max_steps_per_episode": 500,       # Max steps per episode before truncation
 
         'video_camera_pos_override': (1.8, -1.8, 2.0),
         'video_camera_lookat_override': (0.3, 0.0, 0.5),

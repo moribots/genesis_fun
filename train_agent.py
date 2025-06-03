@@ -14,7 +14,6 @@ import os
 import sys
 import getpass
 from typing import Optional, List, Dict, Any
-import numbers
 
 import traceback
 import torch
@@ -22,13 +21,17 @@ import numpy as np
 import wandb
 from wandb.sdk.wandb_run import Run as WandbRun
 
+import gymnasium as gym  # For spaces
+from gymnasium import spaces
+
 import genesis as gs  # type: ignore
 
 from stable_baselines3 import PPO
+# VecEnvWrapper no longer needed for obs
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.utils import set_random_seed, safe_mean
-from stable_baselines3.common.policies import ActorCriticPolicy  # Used by PPO
+# from stable_baselines3.common.policies import ActorCriticPolicy # MlpPolicy is a type of ActorCriticPolicy
 from wandb.integration.sb3 import WandbCallback as WandbCallbackSB3
 
 # Environment with shelf parameter observation
@@ -60,6 +63,9 @@ class WandbDetailedMetricsCallback(BaseCallback):
         self.rollout_data = {key: [] for key in self.metrics_to_track}
 
     def _on_training_start(self) -> None:
+        """
+        Called when the training begins.
+        """
         if self.verbose > 0:
             print(
                 f"--- WandbDetailedMetricsCallback: Training started. Logging to W&B run: {self.wandb_run is not None} ---")
@@ -106,7 +112,6 @@ class WandbDetailedMetricsCallback(BaseCallback):
                 metrics_to_log_wandb[f"custom_rollout_stats/{key}"] = mean_value
 
         if metrics_to_log_wandb and self.wandb_run is not None:
-            # MOD: Removed step=self.num_timesteps to avoid conflict with tensorboard syncing
             self.wandb_run.log(metrics_to_log_wandb)
             if self.verbose > 0:
                 print(
@@ -122,6 +127,15 @@ class VideoCheckpointCallback(CheckpointCallback):
     Callback for saving a model checkpoint and recording/logging a video.
     It extends the CheckpointCallback to also trigger video recording
     at specified intervals (multiples of checkpoint frequency).
+
+    :param save_freq: Save checkpoints every `save_freq` call of the callback.
+    :param save_path: Path to the folder where the model will be saved.
+    :param name_prefix: Common prefix to use for saving models
+    :param video_log_freq_multiplier: Record video every `video_log_freq_multiplier` checkpoints.
+    :param video_length: Length of the video to record in steps.
+    :param video_fps: FPS for the recorded video.
+    :param verbose: Verbosity level.
+    :param wandb_run: Optional W&B run instance for logging videos.
     """
 
     def __init__(self,
@@ -138,17 +152,24 @@ class VideoCheckpointCallback(CheckpointCallback):
         self.video_length = video_length
         self.video_fps = video_fps
         self.wandb_run = wandb_run
-        self.video_log_freq_multiplier = max(1, video_log_freq_multiplier)
-        self.checkpoint_count = 0
+        self.video_log_freq_multiplier = max(
+            1, video_log_freq_multiplier)  # Ensure it's at least 1
+        self.checkpoint_count = 0  # Counter for checkpoints to manage video recording frequency
 
     def _on_step(self) -> bool:
+        """
+        This method will be called by the model after each call to `env.step()`.
+        """
+        # First, execute the parent class's _on_step for checkpoint saving
         continue_training = super()._on_step()
         if not continue_training:
-            return False
+            return False  # Stop training if parent callback decided so
 
+        # Check if a checkpoint was made in this step by the parent
         if self.num_timesteps > 0 and self.num_timesteps % self.save_freq == 0:
             self.checkpoint_count += 1
 
+            # Trigger video recording based on the video_log_freq_multiplier
             if self.checkpoint_count % self.video_log_freq_multiplier == 0:
                 if self.verbose > 0:
                     print(
@@ -158,13 +179,26 @@ class VideoCheckpointCallback(CheckpointCallback):
                 video_save_dir = os.path.join(self.save_path, "videos")
                 os.makedirs(video_save_dir, exist_ok=True)
 
-                actual_env_for_video = self.training_env.venv if hasattr(
-                    self.training_env, 'venv') else self.training_env
+                # Access the underlying FrankaShelfEnv for video recording methods.
+                # self.training_env is VecNormalize, its venv is FrankaShelfEnv (as per create_training_env)
+                actual_env_for_video = self.training_env.venv
+
+                if not isinstance(actual_env_for_video, FrankaShelfEnv):
+                    if self.verbose > 0:
+                        print(
+                            f"Warning: Expected venv to be FrankaShelfEnv for video recording, but got {type(actual_env_for_video)}. Trying to access unwrapped.")
+                    if hasattr(actual_env_for_video, 'unwrapped') and isinstance(actual_env_for_video.unwrapped, FrankaShelfEnv):
+                        actual_env_for_video = actual_env_for_video.unwrapped
+                    else:  # Fallback if specific instance not found, might be an issue
+                        if self.verbose > 0:
+                            print(
+                                f"Video recording methods might not be available on {type(actual_env_for_video)}.")
 
                 if not hasattr(actual_env_for_video, 'start_video_recording') or \
                    not hasattr(actual_env_for_video, 'stop_video_recording'):
                     if self.verbose > 0:
-                        print("Video recording methods not found on the environment.")
+                        print(
+                            f"Video recording methods not found on the environment instance: {type(actual_env_for_video)}.")
                     return True
 
                 if not actual_env_for_video.start_video_recording(env_idx_to_focus=0):
@@ -176,22 +210,40 @@ class VideoCheckpointCallback(CheckpointCallback):
                     print(
                         f"Running dedicated episode for video recording (length {self.video_length})...")
 
-                obs_for_video_predict = self.training_env.buf_obs if hasattr(
-                    self.training_env, 'buf_obs') else self.training_env.reset()
+                # Get current unnormalized observations for all environments.
+                # self.training_env.buf_obs contains the *unnormalized* observations from FrankaShelfEnv.
+                # model.predict handles normalization internally if the env is VecNormalize.
+                # It's assumed self.training_env.buf_obs is available and populated.
+                current_obs_batch_unnormalized = self.training_env.buf_obs.copy()
 
-                ep_rewards_video = []
-                dones_video = np.array([False] * self.training_env.num_envs)
+                # Store rewards per environment for the video episode
+                ep_rewards_video_all_envs = [
+                    [] for _ in range(self.training_env.num_envs)]
 
                 for _ in range(self.video_length):
-                    if dones_video[0]:
-                        break
-                    all_actions, _ = self.model.predict(
-                        obs_for_video_predict, deterministic=True)
-                    next_obs_dict, rewards, dones_step, infos = self.training_env.step(
-                        all_actions)
-                    obs_for_video_predict = next_obs_dict
-                    ep_rewards_video.append(rewards[0])
-                    dones_video = dones_step
+                    # Predict actions for all environments using unnormalized observations.
+                    # model.predict will handle normalization if self.training_env is VecNormalize.
+                    actions_batch, _ = self.model.predict(
+                        current_obs_batch_unnormalized, deterministic=True)
+
+                    # Step all environments with the predicted actions
+                    # next_obs_batch_normalized here are the observations *after* normalization by VecNormalize.step
+                    next_obs_batch_normalized, rewards_batch, dones_batch, infos_batch = self.training_env.step(
+                        actions_batch)
+
+                    # Update current_obs_batch_unnormalized with the *unnormalized* observations for the next prediction step.
+                    # The buf_obs in VecNormalize stores the *unnormalized* obs from the underlying env.
+                    current_obs_batch_unnormalized = self.training_env.buf_obs.copy()
+
+                    # Store rewards for all environments for this step
+                    for i in range(self.training_env.num_envs):
+                        ep_rewards_video_all_envs[i].append(rewards_batch[i])
+
+                # Consolidate all rewards collected during the video episode
+                all_collected_rewards_in_video = [
+                    r for env_rewards in ep_rewards_video_all_envs for r in env_rewards]
+                mean_video_reward = safe_mean(
+                    all_collected_rewards_in_video) if all_collected_rewards_in_video else 0.0
 
                 video_file_path = actual_env_for_video.stop_video_recording(
                     save_dir=video_save_dir, filename=video_filename, fps=self.video_fps)
@@ -200,7 +252,7 @@ class VideoCheckpointCallback(CheckpointCallback):
                     try:
                         log_payload = {
                             f"media/training_video_step": wandb.Video(video_file_path, fps=self.video_fps, format="mp4"),
-                            f"diagnostics/video_ep_mean_reward_env0_step": safe_mean(ep_rewards_video) if ep_rewards_video else 0
+                            f"diagnostics/video_ep_mean_reward_all_envs_step": mean_video_reward
                         }
                         self.wandb_run.log(
                             log_payload, step=self.num_timesteps)
@@ -214,9 +266,16 @@ class VideoCheckpointCallback(CheckpointCallback):
 
 def setup_wandb(project_name: Optional[str], entity: Optional[str], config: Dict[str, Any],
                 monitor_gym: bool = True, save_code: bool = True) -> Optional[WandbRun]:
-    """ 
+    """
     Sets up Weights & Biases for experiment tracking.
     Handles login and initialization of a W&B run.
+
+    :param project_name: Name of the W&B project. If None, W&B is skipped.
+    :param entity: W&B entity (username or team name).
+    :param config: Dictionary of hyperparameters to log.
+    :param monitor_gym: Whether to monitor Gym environments with W&B.
+    :param save_code: Whether to save the main script to W&B.
+    :return: W&B run instance if successful, else None.
     """
     if not project_name:
         print("W&B project name not provided. Skipping W&B setup.")
@@ -259,9 +318,12 @@ def setup_wandb(project_name: Optional[str], entity: Optional[str], config: Dict
 
 
 def create_env_config(training_config: Dict[str, Any]) -> Dict[str, Any]:
-    """ 
+    """
     Creates the configuration dictionary specifically for initializing FrankaShelfEnv.
     Extracts relevant parameters from the main training_config.
+
+    :param training_config: The main configuration dictionary for the training script.
+    :return: A dictionary with parameters for FrankaShelfEnv.
     """
     return dict(
         render_mode=None,
@@ -290,29 +352,39 @@ def create_env_config(training_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def create_training_env(num_genesis_envs: int, seed: int, env_kwargs: Dict[str, Any], gamma: float) -> VecNormalize:
-    """ 
-    Creates the FrankaShelfEnv, seeds it, and wraps it with VecNormalize.
+    """
+    Creates the FrankaShelfEnv, seeds it, and then wraps with VecNormalize.
+    Assumes FrankaShelfEnv now directly returns a flat Box observation space.
+
+    :param num_genesis_envs: Number of parallel environments for Genesis.
+    :param seed: Random seed for the environment.
+    :param env_kwargs: Dictionary of keyword arguments for FrankaShelfEnv.
+    :param gamma: Discount factor for rewards, used by VecNormalize.
+    :return: The normalized vectorized environment.
     """
     try:
-        env = FrankaShelfEnv(**env_kwargs)
-        env.seed(seed)
+        # 1. Instantiate the base FrankaShelfEnv (which is a VecEnv)
+        # This environment is now assumed to have a flat Box observation space.
+        base_vec_env = FrankaShelfEnv(**env_kwargs)
+        base_vec_env.seed(seed)
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to create FrankaShelfEnv: {e}")
         traceback.print_exc()
         sys.exit(1)
 
-    if not (hasattr(env, 'num_envs') and hasattr(env, 'observation_space') and hasattr(env, 'action_space') and
-            callable(getattr(env, 'reset', None)) and callable(getattr(env, 'step_async', None)) and
-            callable(getattr(env, 'step_wait', None))):
-        print("CRITICAL ERROR: Created environment does not conform to VecEnv interface.")
+    # 2. Verify the observation space is as expected (flat Box)
+    if not isinstance(base_vec_env.observation_space, spaces.Dict):
+        print(
+            f"CRITICAL ERROR: FrankaShelfEnv observation space is not Dict: {type(base_vec_env.observation_space)}. Expected flat Box for MlpPolicy.")
         sys.exit(1)
 
-    if env.num_envs != num_genesis_envs:
+    if base_vec_env.num_envs != num_genesis_envs:
         print(
-            f"Warning: FrankaShelfEnv num_envs ({env.num_envs}) differs from requested num_genesis_envs ({num_genesis_envs}).")
+            f"Warning: FrankaShelfEnv num_envs ({base_vec_env.num_envs}) differs from requested num_genesis_envs ({num_genesis_envs}).")
 
+    # 3. Wrap with VecNormalize for observation and reward normalization
     normalized_env = VecNormalize(
-        env,
+        base_vec_env,  # Pass the base VecEnv directly
         norm_obs=True,
         norm_reward=True,
         gamma=gamma
@@ -323,11 +395,18 @@ def create_training_env(num_genesis_envs: int, seed: int, env_kwargs: Dict[str, 
 def create_ppo_model(config: Dict[str, Any], env: VecNormalize,
                      policy_kwargs: Optional[Dict[str, Any]], log_dir: str,
                      wandb_run: Optional[WandbRun] = None) -> PPO:
-    """ 
+    """
     Creates and returns a PPO agent from Stable Baselines3.
+
+    :param config: Dictionary of training configurations.
+    :param env: The VecNormalize wrapped training environment.
+    :param policy_kwargs: Dictionary of keyword arguments for the policy network.
+    :param log_dir: Directory for TensorBoard logs.
+    :param wandb_run: Optional W&B run instance (not directly used by PPO constructor here).
+    :return: The PPO model instance.
     """
     model = PPO(
-        policy=config["policy_type"],
+        policy=config["policy_type"],  # Should be "MlpPolicy"
         env=env,
         verbose=1,
         tensorboard_log=log_dir,
@@ -350,8 +429,16 @@ def create_ppo_model(config: Dict[str, Any], env: VecNormalize,
 def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
                      log_dir: str, model_save_path_base: str,
                      wandb_run_instance: Optional[WandbRun]) -> List[BaseCallback]:
-    """ 
+    """
     Creates a list of callbacks for training, including checkpointing, evaluation, and W&B logging.
+
+    :param config: Dictionary of training configurations.
+    :param model: The PPO model instance.
+    :param eval_env: The VecNormalize wrapped environment for evaluation.
+    :param log_dir: Directory for logs and saved models.
+    :param model_save_path_base: Base path string for saving model checkpoints.
+    :param wandb_run_instance: Optional W&B run instance for callbacks.
+    :return: A list of BaseCallback instances.
     """
     callbacks = []
 
@@ -386,20 +473,18 @@ def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
     )
     callbacks.append(eval_callback)
 
-    # MOD: Add the new WandbDetailedMetricsCallback
     if wandb_run_instance:
         detailed_metrics_cb = WandbDetailedMetricsCallback(
             wandb_run_instance=wandb_run_instance, verbose=1)
         callbacks.append(detailed_metrics_cb)
 
-        # The original WandbCallbackSB3 can still be used for its other logging features
-        # (model checkpoints to W&B, default SB3 logger metrics, etc.)
         wandb_sb3_callback = WandbCallbackSB3(
             model_save_path=os.path.join(
                 log_dir, f"wandb_models/{wandb_run_instance.id}"),
-            model_save_freq=config.get("wandb_model_save_freq_rollouts", 0),
-            gradient_save_freq=config.get("wandb_model_save_freq_rollouts", 0),
-            log="all",  # This will continue to log SB3 default logger content
+            model_save_freq=config.get(
+                "wandb_model_save_freq_rollouts", 0),
+            gradient_save_freq=0,
+            log="all",
             verbose=2
         )
         callbacks.append(wandb_sb3_callback)
@@ -410,9 +495,17 @@ def create_callbacks(config: Dict[str, Any], model: PPO, eval_env: VecNormalize,
 def train_and_save_model(model: PPO, config: Dict[str, Any], callbacks: List[BaseCallback],
                          model_save_path_base: str, env: VecNormalize, log_dir: str,
                          wandb_run_instance: Optional[WandbRun]) -> None:
-    """ 
+    """
     Runs the main training loop and handles final model and VecNormalize stats saving.
     Also logs artifacts to W&B if enabled.
+
+    :param model: The PPO model to train.
+    :param config: Dictionary of training configurations.
+    :param callbacks: List of callbacks to use during training.
+    :param model_save_path_base: Base path string for saving the final model.
+    :param env: The VecNormalize wrapped training environment (for saving stats).
+    :param log_dir: Directory for logs.
+    :param wandb_run_instance: Optional W&B run instance for logging artifacts.
     """
     try:
         model.learn(
@@ -461,9 +554,12 @@ def train_and_save_model(model: PPO, config: Dict[str, Any], callbacks: List[Bas
 
 
 def cleanup_training(env: Optional[VecNormalize], wandb_run_instance: Optional[WandbRun]) -> None:
-    """ 
+    """
     Performs cleanup operations after training, such as closing the environment
     and finishing the W&B run.
+
+    :param env: The training environment to close.
+    :param wandb_run_instance: The W&B run instance to finish.
     """
     if env:
         try:
@@ -481,10 +577,12 @@ def cleanup_training(env: Optional[VecNormalize], wandb_run_instance: Optional[W
 
 
 def run_franka_training(training_config: Dict[str, Any]) -> None:
-    """ 
+    """
     Main orchestrator for the Franka agent training process.
     Initializes Genesis, sets up W&B, creates environment and agent,
     manages training, and handles cleanup.
+
+    :param training_config: A dictionary containing all configuration parameters for the training run.
     """
     gs_initialized_locally = False
     train_env_instance: Optional[VecNormalize] = None
@@ -530,7 +628,8 @@ def run_franka_training(training_config: Dict[str, Any]) -> None:
             env_kwargs=env_specific_config,
             gamma=training_config["gamma"]
         )
-        print("Training environment created and normalized.")
+        print(
+            f"Training environment created and normalized. Observation space: {train_env_instance.observation_space}")
 
         policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
         print(f"Using policy_kwargs: {policy_kwargs}")
@@ -578,48 +677,55 @@ def run_franka_training(training_config: Dict[str, Any]) -> None:
 
 if __name__ == '__main__':
     config_params = {
+        # --- Training Duration & Environment Setup ---
+        "total_timesteps": 50_000_000,
+        "num_genesis_envs": 1024,
+
+        # --- PPO Hyperparameters ---
         "policy_type": "MultiInputPolicy",
         "seed": 42,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "n_steps_ppo": 1024,
-        "batch_size_ppo": 12288,
+        "n_steps_ppo": 24,
+        "batch_size_ppo": 24*1024,
         "n_epochs_ppo": 4,
         "learning_rate": 3e-4,
         "clip_range": 0.2,
         "ent_coef": 0.0001,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "total_timesteps": 100_000_000,
-        "num_genesis_envs": 1024,
 
+        # --- FrankaShelfEnv Specific Configuration (Reworked for Fast EE Reaching) ---
         "workspace_bounds_xyz_override": ((-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
         "include_shelf": False,
-        "randomize_shelf_config": False,
+        "randomize_shelf_config": True,
 
+        # --- Reward Coefficients (Reworked for Speed) ---
+        "k_dist_reward": 15.0,
+        "k_time_penalty": 0.5,
+        "k_action_penalty": 0.0005,
+        "k_joint_limit_penalty": 5.0,
+        "k_collision_penalty": 15.0,
+        "k_accel_penalty": 0.0005,
+        "success_reward_val": 300.0,
+        "success_threshold_val": 0.05,
+        "max_steps_per_episode": 300,
+
+        # --- Logging, Saving, and W&B ---
         "log_dir": "./training_logs/ppo_franka_shelf_params_obs/",
         "model_save_path": "./training_logs/ppo_franka_shelf_params_obs/model_shelf_params",
         "wandb_project_name": "FrankaPPO-Reach",
         "wandb_entity": None,
         "wandb_model_save_freq_rollouts": 1,
 
-        "checkpoint_save_freq_rollouts": 1,
-        "eval_freq_rollouts": 1,
-        "video_log_freq_multiplier": 5,
-        "video_length": 300,
+        # --- Callbacks Configuration ---
+        "checkpoint_save_freq_rollouts": 5,
+        "eval_freq_rollouts": 5,
+        "video_log_freq_multiplier": 2,
+        "video_length": 250,
         "video_fps": 30,
 
-        # Reward coefficients
-        "k_dist_reward": 10.0,               # Distance reward (negative)
-        "k_time_penalty": 0.01,             # Per-step time penalty
-        "k_action_penalty": 0.001,          # Penalty for large actions
-        "k_joint_limit_penalty": 5.0,      # Penalty for being near joint limits
-        "k_collision_penalty": 20.0,        # Penalty for collisions
-        "k_accel_penalty": 0.0001,          # Penalty for high joint accelerations
-        "success_reward_val": 100.0,         # Reward for achieving success
-        "success_threshold_val": 0.05,      # Distance threshold for success
-        "max_steps_per_episode": 500,       # Max steps per episode before truncation
-
+        # --- Video Camera Parameters (for recording) ---
         'video_camera_pos_override': (1.8, -1.8, 2.0),
         'video_camera_lookat_override': (0.3, 0.0, 0.5),
         'video_camera_fov_override': 45,

@@ -9,6 +9,7 @@ parameters (pose, size) of these 5 shelf components.
 The action space is continuous joint velocity control.
 It uses the Genesis simulation engine for physics and rendering.
 """
+from stable_baselines3.common.vec_env import VecNormalize
 import os
 import sys
 import random
@@ -117,14 +118,14 @@ class FrankaShelfEnv(VecEnv):
 
         robot_state_flat_dim = self.FRANKA_NUM_ARM_JOINTS * 2 + 3 + 4
         relative_target_pos_dim = 3
-        shelf_component_params_flat_dim = self.SHELF_NUM_COMPONENTS * \
-            self.NUM_PARAMS_PER_SHELF_COMPONENT
 
         _observation_space = spaces.Dict({
             "robot_state_flat": spaces.Box(low=np.full(robot_state_flat_dim, -np.inf, dtype=np.float32), high=np.full(robot_state_flat_dim, np.inf, dtype=np.float32), dtype=np.float32),
-            "relative_target_pos": spaces.Box(low=np.full(relative_target_pos_dim, -np.inf, dtype=np.float32), high=np.full(relative_target_pos_dim, np.inf, dtype=np.float32), dtype=np.float32),
-            "shelf_component_params": spaces.Box(low=-np.inf, high=np.inf, shape=(shelf_component_params_flat_dim,), dtype=np.float32)
+            "relative_target_pos": spaces.Box(low=np.full(relative_target_pos_dim, -np.inf, dtype=np.float32), high=np.full(relative_target_pos_dim, np.inf, dtype=np.float32), dtype=np.float32)
         })
+
+        _action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(self.FRANKA_NUM_ARM_JOINTS,), dtype=np.float32)
         _action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.FRANKA_NUM_ARM_JOINTS,), dtype=np.float32)
 
@@ -204,6 +205,13 @@ class FrankaShelfEnv(VecEnv):
         self._build_shelf_structure_and_populate_params_batched()
         # This uses the info from _build_shelf_structure_and_populate_params_batched to set targets.
         self._generate_target_in_shelf_batched()
+
+    def _initialize_obs_buffer(self) -> None:
+        """Initializes observation buffers `self.buf_obs` for SB3 compatibility."""
+        self.buf_obs = {
+            key: np.zeros((self.num_envs, *space.shape), dtype=space.dtype)
+            for key, space in self.observation_space.spaces.items()
+        }
 
     def _define_shelf_configurations(self) -> None:
         self.shelf_configurations: Dict[str, Dict[str, Any]] = {
@@ -474,11 +482,14 @@ class FrankaShelfEnv(VecEnv):
             final_shelf_params_for_obs = current_shelf_params_for_obs.astype(
                 np.float32)
 
-        return {
+        obs_dict = {
             "robot_state_flat": robot_state_flat_batch,
-            "relative_target_pos": relative_target_pos_batch,
-            "shelf_component_params": final_shelf_params_for_obs
+            "relative_target_pos": relative_target_pos_batch
         }
+
+        # **FIX**: Update the internal observation buffer before returning.
+        self.buf_obs = obs_dict
+        return obs_dict
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> VecEnvObs:
         if seed is not None:
@@ -575,14 +586,14 @@ class FrankaShelfEnv(VecEnv):
             np.sum(np.square(actions_clipped_batch), axis=1)
 
         penalty_joint_limit = np.zeros(self.num_envs, dtype=np.float32)
-        near_limit_thresh = 0.05
-        for i in range(self.FRANKA_NUM_ARM_JOINTS):
-            penalty_joint_limit -= self.k_joint_limit_penalty * \
-                np.maximum(
-                    0, (self.FRANKA_QPOS_LOWER[i] + near_limit_thresh) - arm_joint_pos_batch[:, i])
-            penalty_joint_limit -= self.k_joint_limit_penalty * \
-                np.maximum(
-                    0, arm_joint_pos_batch[:, i] - (self.FRANKA_QPOS_UPPER[i] - near_limit_thresh))
+        # near_limit_thresh = 0.05
+        # for i in range(self.FRANKA_NUM_ARM_JOINTS):
+        #     penalty_joint_limit -= self.k_joint_limit_penalty * \
+        #         np.maximum(
+        #             0, (self.FRANKA_QPOS_LOWER[i] + near_limit_thresh) - arm_joint_pos_batch[:, i])
+        #     penalty_joint_limit -= self.k_joint_limit_penalty * \
+        #         np.maximum(
+        #             0, arm_joint_pos_batch[:, i] - (self.FRANKA_QPOS_UPPER[i] - near_limit_thresh))
 
         penalty_collision = np.zeros(self.num_envs, dtype=np.float32)
         terminated_collision = np.zeros(self.num_envs, dtype=bool)
@@ -833,6 +844,13 @@ if __name__ == '__main__':
                              include_shelf=False, randomize_shelf_config=False,  # Using default_center_reach
                              )
 
+        norm_env = VecNormalize(
+            env,  # Pass the base VecEnv directly
+            norm_obs=True,
+            norm_reward=True,
+            gamma=0.99
+        )
+
         print(
             f"FrankaShelfEnv created. Obs Space: {env.observation_space}, Act Space: {env.action_space}")
         print(
@@ -865,11 +883,10 @@ if __name__ == '__main__':
             env.step_async(actions)
             next_obs_batch, rewards_b, dones_b, infos_b = env.step_wait()
 
+            current_obs_batch_unnormalized = norm_env.buf_obs.copy()
+
             if env.render_mode == "human":
                 env.render(mode="human")
-
-            print("    Observed shelf_component_params for env 0:",
-                  next_obs_batch["shelf_component_params"][0])
         print("\nBasic test loop finished.")
 
     except Exception as e_runtime:

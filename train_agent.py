@@ -382,7 +382,7 @@ class RunnerConfig:
     # --- General ---
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed: int = 42
-    max_iterations: int = 20000
+    max_iterations: int = 2001
 
     # --- Runner-specific parameters for RSL-RL ---
     empirical_normalization: bool = True
@@ -397,7 +397,7 @@ class RunnerConfig:
     checkpoint_path: str = ""  # path to checkpoint
 
     # --- Video Logging ---
-    video_log_interval: int = 1000  # log video every 1000 iterations
+    video_log_interval: int = 500  # log video every 1000 iterations
     video_length: int = 300  # steps to record in video
 
     # --- W&B Integration ---

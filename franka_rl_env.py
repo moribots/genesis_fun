@@ -13,6 +13,7 @@ import random
 import math
 from typing import List, Any, Optional, Union, Dict, Tuple
 import traceback
+from collections import deque
 
 import numpy as np
 import torch
@@ -88,8 +89,9 @@ class FrankaShelfEnv(VecEnv):
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
                  k_dist_reward: float = 1.0, k_time_penalty: float = 0.01, k_action_penalty: float = 0.001,
                  k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
-                 k_accel_penalty: float = 0.0, success_reward_val: float = 200.0,
-                 success_threshold_val: float = 0.05,
+                 k_accel_penalty: float = 0.0, k_alive_bonus: float = 0.0,
+                 success_reward_val: float = 200.0, success_threshold_val: float = 0.05,
+                 success_rate_threshold_for_time_penalty: float = 0.7,
                  video_camera_pos: Tuple[float,
                                          float, float] = (1.8, -1.8, 2.0),
                  video_camera_lookat: Tuple[float,
@@ -125,7 +127,13 @@ class FrankaShelfEnv(VecEnv):
         self.franka_xml_path = franka_xml_path
         self.k_dist_reward, self.k_time_penalty, self.k_action_penalty = k_dist_reward, k_time_penalty, k_action_penalty
         self.k_joint_limit_penalty, self.k_collision_penalty, self.k_accel_penalty = k_joint_limit_penalty, k_collision_penalty, k_accel_penalty
+        self.k_alive_bonus = k_alive_bonus
         self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
+
+        # Curriculum learning attributes
+        self.success_rate_threshold = success_rate_threshold_for_time_penalty
+        self.success_buffer = deque(maxlen=100 * self.num_envs)
+        self.current_success_rate = 0.0
 
         self._define_shelf_configurations()
         self.current_shelf_config_key_per_env: List[str] = [""] * self.num_envs
@@ -530,27 +538,58 @@ class FrankaShelfEnv(VecEnv):
         dist_to_target_batch = np.linalg.norm(
             ee_pos_batch - self.target_position_world_batch, axis=1)
 
-        # Reward components
-        reward_dist = -self.k_dist_reward * dist_to_target_batch
-        penalty_time = -self.k_time_penalty * \
-            np.ones(self.num_envs, dtype=np.float32)
-        penalty_action_mag = -self.k_action_penalty * \
-            np.sum(np.square(actions_clipped_batch), axis=1)
+        # --- Dones ---
+        terminated_success = dist_to_target_batch < self.success_threshold
 
-        penalty_collision = np.zeros(self.num_envs, dtype=np.float32)
         terminated_collision = np.zeros(self.num_envs, dtype=bool)
         if self.scene and self.scene.is_built and self.franka_entity:
             contacts = self.franka_entity.get_contacts()
             if contacts and 'valid_mask' in contacts:
                 valid_mask = to_numpy(contacts['valid_mask'])
-                for i_env in range(self.num_envs):
-                    if np.any(valid_mask[i_env, :]):
-                        penalty_collision[i_env] = -self.k_collision_penalty
-                        terminated_collision[i_env] = True
+                terminated_collision = np.any(valid_mask, axis=1)
 
-        reward_success = np.zeros(self.num_envs, dtype=np.float32)
-        terminated_success = dist_to_target_batch < self.success_threshold
-        reward_success[terminated_success] = self.success_reward
+        terminated = np.logical_or(terminated_collision, terminated_success)
+        truncated = self.episode_length_buf.cpu().numpy() >= self.max_episode_length
+        dones_np = np.logical_or(terminated, truncated)
+
+        # Update success buffer with results from completed episodes
+        done_indices = np.where(dones_np)[0]
+        if len(done_indices) > 0:
+            successes_on_done = terminated_success[done_indices]
+            self.success_buffer.extend(successes_on_done.astype(int))
+
+        # Update success rate based on the buffer
+        if len(self.success_buffer) > 0:
+            self.current_success_rate = np.mean(self.success_buffer)
+
+        # --- Reward Components ---
+        reward_dist = -self.k_dist_reward * dist_to_target_batch
+
+        # Conditionally apply time penalty and alive bonus based on curriculum
+        time_penalty_active = self.current_success_rate >= self.success_rate_threshold
+
+        penalty_time = np.zeros(self.num_envs, dtype=np.float32)
+        if time_penalty_active:
+            penalty_time = -self.k_time_penalty * \
+                np.ones(self.num_envs, dtype=np.float32)
+
+        alive_bonus = np.zeros(self.num_envs, dtype=np.float32)
+        if not time_penalty_active:
+            alive_bonus = self.k_alive_bonus * \
+                np.ones(self.num_envs, dtype=np.float32)
+
+        penalty_action_mag = -self.k_action_penalty * \
+            np.sum(np.square(actions_clipped_batch), axis=1)
+
+        out_of_bounds = (arm_joint_pos_batch < self.FRANKA_QPOS_LOWER) | (
+            arm_joint_pos_batch > self.FRANKA_QPOS_UPPER)
+        penalty_joint_limit = -self.k_joint_limit_penalty * \
+            np.sum(out_of_bounds, axis=1)
+
+        penalty_collision = -self.k_collision_penalty * \
+            terminated_collision.astype(float)
+
+        reward_success = self.success_reward * terminated_success.astype(float)
 
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
         if self.k_accel_penalty > 0 and self.dt > 0:
@@ -560,36 +599,44 @@ class FrankaShelfEnv(VecEnv):
 
         # Total reward
         rewards_np = reward_dist + penalty_time + penalty_action_mag + \
-            penalty_collision + reward_success + penalty_accel
+            penalty_joint_limit + penalty_collision + \
+            reward_success + penalty_accel + alive_bonus
         self.rew_buf = torch.from_numpy(rewards_np).to(self.device)
         self.episode_reward_buf += self.rew_buf
 
-        # Dones (reset buffer)
-        terminated = np.logical_or(terminated_collision, terminated_success)
-        truncated = self.episode_length_buf.cpu().numpy() >= self.max_episode_length
-        dones_np = np.logical_or(terminated, truncated)
+        # Update reset buffer
         self.reset_buf = torch.from_numpy(dones_np).to(self.device).long()
 
-        # Populate the extras dictionary for logging
-        self.extras.clear()  # Clear from previous step
+        # --- Populate the extras dictionary for logging ---
+        self.extras.clear()
         self.extras["is_success"] = torch.from_numpy(
             terminated_success).to(self.device)
         self.extras["dist_to_target"] = torch.from_numpy(
             dist_to_target_batch).to(self.device)
 
-        # Add individual reward components for detailed logging
+        # Add individual reward components
         self.extras["reward_components/distance"] = torch.from_numpy(
             reward_dist).to(self.device)
         self.extras["reward_components/time_penalty"] = torch.from_numpy(
             penalty_time).to(self.device)
         self.extras["reward_components/action_penalty"] = torch.from_numpy(
             penalty_action_mag).to(self.device)
+        self.extras["reward_components/joint_limit_penalty"] = torch.from_numpy(
+            penalty_joint_limit).to(self.device)
         self.extras["reward_components/collision_penalty"] = torch.from_numpy(
             penalty_collision).to(self.device)
         self.extras["reward_components/success_reward"] = torch.from_numpy(
             reward_success).to(self.device)
         self.extras["reward_components/accel_penalty"] = torch.from_numpy(
             penalty_accel).to(self.device)
+        self.extras["reward_components/alive_bonus"] = torch.from_numpy(
+            alive_bonus).to(self.device)
+
+        # Add curriculum info
+        self.extras["curriculum/success_rate"] = torch.tensor(
+            self.current_success_rate, device=self.device)
+        self.extras["curriculum/time_penalty_active"] = torch.tensor(
+            1.0 if time_penalty_active else 0.0, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):

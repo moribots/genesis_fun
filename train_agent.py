@@ -165,8 +165,8 @@ class CustomOnPolicyRunner(OnPolicyRunner):
 
         # Bookkeeping for custom reward component logging
         reward_component_names = [
-            "distance", "time_penalty", "action_penalty",
-            "collision_penalty", "success_reward", "accel_penalty"
+            "distance", "time_penalty", "action_penalty", "joint_limit_penalty",
+            "collision_penalty", "success_reward", "accel_penalty", "alive_bonus"
         ]
         reward_component_buffers = {name: deque(
             maxlen=100) for name in reward_component_names}
@@ -263,6 +263,14 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                         self.writer.add_scalar(
                             f"Rewards/{name}", statistics.mean(buffer), it)
 
+                # Log curriculum-related info from the env's `extras` dict (now in `infos`)
+                if "curriculum/success_rate" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Success Rate", infos["curriculum/success_rate"].item(), it)
+                if "curriculum/time_penalty_active" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Time Penalty Active", infos["curriculum/time_penalty_active"].item(), it)
+
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
                 self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
@@ -287,14 +295,17 @@ class EnvConfig:
     seed: int = 42
 
     # Environment-specific parameters, passed to FrankaShelfEnv constructor
-    k_dist_reward: float = 15.0
+    k_dist_reward: float = 2.0
     k_time_penalty: float = 0.5
     k_action_penalty: float = 0.0005
     k_joint_limit_penalty: float = 5.0
-    k_collision_penalty: float = 15.0
+    k_collision_penalty: float = 10.0
     k_accel_penalty: float = 0.0005
+    k_alive_bonus: float = 1.0
     success_reward_val: float = 300.0
     success_threshold_val: float = 0.05
+    # I basically don't want this for now, but I want to keep the curriciulum structure for other things.
+    success_rate_threshold_for_time_penalty: float = 0.95
     include_shelf: bool = False
     randomize_shelf_config: bool = True
     workspace_bounds_xyz: tuple = ((-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5))
@@ -451,8 +462,10 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "k_joint_limit_penalty": cfg.env.k_joint_limit_penalty,
             "k_collision_penalty": cfg.env.k_collision_penalty,
             "k_accel_penalty": cfg.env.k_accel_penalty,
+            "k_alive_bonus": cfg.env.k_alive_bonus,
             "success_reward_val": cfg.env.success_reward_val,
             "success_threshold_val": cfg.env.success_threshold_val,
+            "success_rate_threshold_for_time_penalty": cfg.env.success_rate_threshold_for_time_penalty,
             "include_shelf": cfg.env.include_shelf,
             "randomize_shelf_config": cfg.env.randomize_shelf_config,
             "workspace_bounds_xyz": cfg.env.workspace_bounds_xyz,

@@ -317,13 +317,13 @@ class EnvConfig:
     seed: int = 42
 
     # Environment-specific parameters, passed to FrankaShelfEnv constructor
-    k_dist_reward: float = 2.0
+    k_dist_reward: float = 1.0
     k_time_penalty: float = 0.5
     k_action_penalty: float = 0.0005
     k_joint_limit_penalty: float = 5.0
-    k_collision_penalty: float = 10.0
-    k_accel_penalty: float = 0.0005
-    k_alive_bonus: float = 1.0
+    k_collision_penalty: float = 20.0
+    k_accel_penalty: float = 0.0001
+    k_alive_bonus: float = 0.1
     success_reward_val: float = 300.0
     success_threshold_val: float = 0.05
 

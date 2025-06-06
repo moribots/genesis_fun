@@ -158,6 +158,8 @@ class CustomOnPolicyRunner(OnPolicyRunner):
         # Bookkeeping for logging, mirrored from the base runner
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
+        # Add buffer for the new target_reached metric
+        target_reached_buffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(
             self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(
@@ -166,7 +168,8 @@ class CustomOnPolicyRunner(OnPolicyRunner):
         # Bookkeeping for custom reward component logging
         reward_component_names = [
             "distance", "time_penalty", "action_penalty", "joint_limit_penalty",
-            "collision_penalty", "success_reward", "accel_penalty", "alive_bonus"
+            "collision_penalty", "success_reward", "accel_penalty", "alive_bonus",
+            "joint_velocity_penalty"
         ]
         reward_component_buffers = {name: deque(
             maxlen=100) for name in reward_component_names}
@@ -187,6 +190,7 @@ class CustomOnPolicyRunner(OnPolicyRunner):
 
             # List to store episode lengths from the current iteration
             iteration_episode_lengths = []
+            iteration_target_reached = []
 
             with torch.inference_mode():
                 # Rollout over the environment
@@ -210,14 +214,21 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                     new_ids = (dones > 0).nonzero(as_tuple=False)
                     if new_ids.numel() > 0:
                         # Get lengths of episodes that just finished in this step
-                        finished_lengths = cur_episode_length[new_ids][:, 0].cpu(
-                        ).numpy().tolist()
+                        finished_lengths = cur_episode_length[new_ids][:,
+                                                                       0].cpu().numpy().tolist()
                         iteration_episode_lengths.extend(finished_lengths)
+                        if "is_target_reached" in infos:
+                            # Convert booleans to integers (0s and 1s) for statistics
+                            iteration_target_reached.extend(
+                                infos["is_target_reached"][new_ids][:, 0].int().cpu().numpy().tolist())
 
                         # Update main buffers for the base logger and smoothed stats
                         rewbuffer.extend(
                             cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(finished_lengths)
+                        if iteration_target_reached:
+                            target_reached_buffer.extend(
+                                iteration_target_reached)
 
                         # Reset buffers for these envs
                         cur_reward_sum[new_ids] = 0
@@ -282,16 +293,27 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                     self.writer.add_scalar(
                         "Rollout/length_max", max(iteration_episode_lengths), it)
 
+                # Log target reached rate for the current rollout
+                if iteration_target_reached:
+                    self.writer.add_scalar(
+                        "Rollout/target_reached_rate", statistics.mean(iteration_target_reached), it)
+
                 # Log curriculum-related info from the env's `extras` dict (now in `infos`)
                 if "curriculum/success_rate" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Success Rate", infos["curriculum/success_rate"].item(), it)
+                if "curriculum/target_reached_rate" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Target Reached Rate", infos["curriculum/target_reached_rate"].item(), it)
                 if "curriculum/time_penalty_scale" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Time Penalty Scale", infos["curriculum/time_penalty_scale"].item(), it)
                 if "curriculum/alive_bonus_scale" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Alive Bonus Scale", infos["curriculum/alive_bonus_scale"].item(), it)
+                if "curriculum/joint_vel_penalty_scale" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Joint Vel Penalty Scale", infos["curriculum/joint_vel_penalty_scale"].item(), it)
 
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
@@ -317,20 +339,22 @@ class EnvConfig:
     seed: int = 42
 
     # Environment-specific parameters, passed to FrankaShelfEnv constructor
-    k_dist_reward: float = 1.0
-    k_time_penalty: float = 0.5
+    k_dist_reward: float = 2.0
+    k_time_penalty: float = 0.0
     k_action_penalty: float = 0.0005
     k_joint_limit_penalty: float = 5.0
     k_collision_penalty: float = 20.0
     k_accel_penalty: float = 0.0001
     k_alive_bonus: float = 0.1
+    k_joint_velocity_penalty: float = 2.0
     success_reward_val: float = 300.0
     success_threshold_val: float = 0.05
+    settle_time_in_steps: int = 20
 
     # Curriculum Learning Parameters
-    success_rate_threshold: float = 1.0
-    # e.g., transition from success_rate_threshold - curriculum_transition_width to success_rate_threshold success rate
-    curriculum_transition_width: float = 0.01  # basically off
+    success_rate_threshold: float = 0.7
+    target_reached_rate_threshold: float = 0.9
+    curriculum_transition_width: float = 0.1
     min_episode_length_for_success_metric: int = 10
 
     include_shelf: bool = False
@@ -490,9 +514,12 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "k_collision_penalty": cfg.env.k_collision_penalty,
             "k_accel_penalty": cfg.env.k_accel_penalty,
             "k_alive_bonus": cfg.env.k_alive_bonus,
+            "k_joint_velocity_penalty": cfg.env.k_joint_velocity_penalty,
             "success_reward_val": cfg.env.success_reward_val,
             "success_threshold_val": cfg.env.success_threshold_val,
+            "settle_time_in_steps": cfg.env.settle_time_in_steps,
             "success_rate_threshold": cfg.env.success_rate_threshold,
+            "target_reached_rate_threshold": cfg.env.target_reached_rate_threshold,
             "curriculum_transition_width": cfg.env.curriculum_transition_width,
             "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,
             "include_shelf": cfg.env.include_shelf,

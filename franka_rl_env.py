@@ -91,7 +91,9 @@ class FrankaShelfEnv(VecEnv):
                  k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
                  k_accel_penalty: float = 0.0, k_alive_bonus: float = 0.0,
                  success_reward_val: float = 200.0, success_threshold_val: float = 0.05,
-                 success_rate_threshold_for_time_penalty: float = 0.7,
+                 success_rate_threshold: float = 0.7,
+                 curriculum_transition_width: float = 0.2,
+                 min_episode_length_for_success_metric: int = 10,
                  video_camera_pos: Tuple[float,
                                          float, float] = (1.8, -1.8, 2.0),
                  video_camera_lookat: Tuple[float,
@@ -131,7 +133,9 @@ class FrankaShelfEnv(VecEnv):
         self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
 
         # Curriculum learning attributes
-        self.success_rate_threshold = success_rate_threshold_for_time_penalty
+        self.success_rate_threshold = success_rate_threshold
+        self.curriculum_transition_width = curriculum_transition_width
+        self.min_episode_length_for_success_metric = min_episode_length_for_success_metric
         self.success_buffer = deque(maxlen=100 * self.num_envs)
         self.current_success_rate = 0.0
 
@@ -552,31 +556,33 @@ class FrankaShelfEnv(VecEnv):
         truncated = self.episode_length_buf.cpu().numpy() >= self.max_episode_length
         dones_np = np.logical_or(terminated, truncated)
 
-        # Update success buffer with results from completed episodes
+        # --- Curriculum Logic ---
+        # Update success buffer only with episodes that ran for a minimum number of steps
         done_indices = np.where(dones_np)[0]
-        if len(done_indices) > 0:
-            successes_on_done = terminated_success[done_indices]
-            self.success_buffer.extend(successes_on_done.astype(int))
+        for idx in done_indices:
+            if self.episode_length_buf[idx] >= self.min_episode_length_for_success_metric:
+                self.success_buffer.append(terminated_success[idx])
 
         # Update success rate based on the buffer
         if len(self.success_buffer) > 0:
             self.current_success_rate = np.mean(self.success_buffer)
 
+        # Calculate curriculum progress (0 to 1) for smooth transition
+        transition_start = self.success_rate_threshold - self.curriculum_transition_width
+        progress = (self.current_success_rate - transition_start) / \
+            self.curriculum_transition_width
+        curriculum_progress = np.clip(progress, 0.0, 1.0)
+
+        time_penalty_scale = curriculum_progress
+        alive_bonus_scale = 1.0 - curriculum_progress
+
         # --- Reward Components ---
         reward_dist = -self.k_dist_reward * dist_to_target_batch
 
-        # Conditionally apply time penalty and alive bonus based on curriculum
-        time_penalty_active = self.current_success_rate >= self.success_rate_threshold
-
-        penalty_time = np.zeros(self.num_envs, dtype=np.float32)
-        if time_penalty_active:
-            penalty_time = -self.k_time_penalty * \
-                np.ones(self.num_envs, dtype=np.float32)
-
-        alive_bonus = np.zeros(self.num_envs, dtype=np.float32)
-        if not time_penalty_active:
-            alive_bonus = self.k_alive_bonus * \
-                np.ones(self.num_envs, dtype=np.float32)
+        penalty_time = -self.k_time_penalty * time_penalty_scale * \
+            np.ones(self.num_envs, dtype=np.float32)
+        alive_bonus = self.k_alive_bonus * alive_bonus_scale * \
+            np.ones(self.num_envs, dtype=np.float32)
 
         penalty_action_mag = -self.k_action_penalty * \
             np.sum(np.square(actions_clipped_batch), axis=1)
@@ -594,7 +600,8 @@ class FrankaShelfEnv(VecEnv):
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
         if self.k_accel_penalty > 0 and self.dt > 0:
             acceleration_sq_sum = np.sum(
-                np.square((arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
+                np.square(
+                    (arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
             penalty_accel = -self.k_accel_penalty * acceleration_sq_sum
 
         # Total reward
@@ -635,8 +642,12 @@ class FrankaShelfEnv(VecEnv):
         # Add curriculum info
         self.extras["curriculum/success_rate"] = torch.tensor(
             self.current_success_rate, device=self.device)
-        self.extras["curriculum/time_penalty_active"] = torch.tensor(
-            1.0 if time_penalty_active else 0.0, device=self.device)
+        self.extras["curriculum/progress"] = torch.tensor(
+            curriculum_progress, device=self.device)
+        self.extras["curriculum/time_penalty_scale"] = torch.tensor(
+            time_penalty_scale, device=self.device)
+        self.extras["curriculum/alive_bonus_scale"] = torch.tensor(
+            alive_bonus_scale, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):

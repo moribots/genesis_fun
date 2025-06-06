@@ -185,6 +185,9 @@ class CustomOnPolicyRunner(OnPolicyRunner):
             # --- Data Collection Phase ---
             collection_start = time.time()
 
+            # List to store episode lengths from the current iteration
+            iteration_episode_lengths = []
+
             with torch.inference_mode():
                 # Rollout over the environment
                 for i in range(self.num_steps_per_env):
@@ -206,10 +209,17 @@ class CustomOnPolicyRunner(OnPolicyRunner):
 
                     new_ids = (dones > 0).nonzero(as_tuple=False)
                     if new_ids.numel() > 0:
+                        # Get lengths of episodes that just finished in this step
+                        finished_lengths = cur_episode_length[new_ids][:, 0].cpu(
+                        ).numpy().tolist()
+                        iteration_episode_lengths.extend(finished_lengths)
+
+                        # Update main buffers for the base logger and smoothed stats
                         rewbuffer.extend(
                             cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(
-                            cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(finished_lengths)
+
+                        # Reset buffers for these envs
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
@@ -263,13 +273,25 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                         self.writer.add_scalar(
                             f"Rewards/{name}", statistics.mean(buffer), it)
 
+                # Log episode length stats from the current iteration only
+                if iteration_episode_lengths:
+                    self.writer.add_scalar(
+                        "Rollout/length_min", min(iteration_episode_lengths), it)
+                    self.writer.add_scalar(
+                        "Rollout/length_mean", statistics.mean(iteration_episode_lengths), it)
+                    self.writer.add_scalar(
+                        "Rollout/length_max", max(iteration_episode_lengths), it)
+
                 # Log curriculum-related info from the env's `extras` dict (now in `infos`)
                 if "curriculum/success_rate" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Success Rate", infos["curriculum/success_rate"].item(), it)
-                if "curriculum/time_penalty_active" in infos:
+                if "curriculum/time_penalty_scale" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Time Penalty Active", infos["curriculum/time_penalty_active"].item(), it)
+                        "Curriculum/Time Penalty Scale", infos["curriculum/time_penalty_scale"].item(), it)
+                if "curriculum/alive_bonus_scale" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Alive Bonus Scale", infos["curriculum/alive_bonus_scale"].item(), it)
 
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
@@ -304,8 +326,13 @@ class EnvConfig:
     k_alive_bonus: float = 1.0
     success_reward_val: float = 300.0
     success_threshold_val: float = 0.05
-    # I basically don't want this for now, but I want to keep the curriciulum structure for other things.
-    success_rate_threshold_for_time_penalty: float = 0.95
+
+    # Curriculum Learning Parameters
+    success_rate_threshold: float = 1.0
+    # e.g., transition from success_rate_threshold - curriculum_transition_width to success_rate_threshold success rate
+    curriculum_transition_width: float = 0.01  # basically off
+    min_episode_length_for_success_metric: int = 10
+
     include_shelf: bool = False
     randomize_shelf_config: bool = True
     workspace_bounds_xyz: tuple = ((-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5))
@@ -370,7 +397,7 @@ class RunnerConfig:
     checkpoint_path: str = ""  # path to checkpoint
 
     # --- Video Logging ---
-    video_log_interval: int = 1000  # log video every 50 iterations
+    video_log_interval: int = 1000  # log video every 1000 iterations
     video_length: int = 300  # steps to record in video
 
     # --- W&B Integration ---
@@ -465,7 +492,9 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "k_alive_bonus": cfg.env.k_alive_bonus,
             "success_reward_val": cfg.env.success_reward_val,
             "success_threshold_val": cfg.env.success_threshold_val,
-            "success_rate_threshold_for_time_penalty": cfg.env.success_rate_threshold_for_time_penalty,
+            "success_rate_threshold": cfg.env.success_rate_threshold,
+            "curriculum_transition_width": cfg.env.curriculum_transition_width,
+            "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,
             "include_shelf": cfg.env.include_shelf,
             "randomize_shelf_config": cfg.env.randomize_shelf_config,
             "workspace_bounds_xyz": cfg.env.workspace_bounds_xyz,

@@ -89,11 +89,9 @@ class FrankaShelfEnv(VecEnv):
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
                  k_dist_reward: float = 1.0, k_time_penalty: float = 0.01, k_action_penalty: float = 0.001,
                  k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
-                 k_accel_penalty: float = 0.0, k_alive_bonus: float = 0.0, k_joint_velocity_penalty: float = 0.0,
+                 k_accel_penalty: float = 0.0, k_alive_bonus: float = 0.0,
                  success_reward_val: float = 200.0, success_threshold_val: float = 0.05,
-                 settle_time_in_steps: int = 20,
                  success_rate_threshold: float = 0.7,
-                 target_reached_rate_threshold: float = 0.8,
                  curriculum_transition_width: float = 0.2,
                  min_episode_length_for_success_metric: int = 10,
                  video_camera_pos: Tuple[float,
@@ -132,25 +130,14 @@ class FrankaShelfEnv(VecEnv):
         self.k_dist_reward, self.k_time_penalty, self.k_action_penalty = k_dist_reward, k_time_penalty, k_action_penalty
         self.k_joint_limit_penalty, self.k_collision_penalty, self.k_accel_penalty = k_joint_limit_penalty, k_collision_penalty, k_accel_penalty
         self.k_alive_bonus = k_alive_bonus
-        self.k_joint_velocity_penalty = k_joint_velocity_penalty
         self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
-        self.settle_time_in_steps = settle_time_in_steps
 
         # Curriculum learning attributes
         self.success_rate_threshold = success_rate_threshold
-        self.target_reached_rate_threshold = target_reached_rate_threshold
         self.curriculum_transition_width = curriculum_transition_width
         self.min_episode_length_for_success_metric = min_episode_length_for_success_metric
         self.success_buffer = deque(maxlen=100 * self.num_envs)
-        self.target_reached_buffer = deque(maxlen=100 * self.num_envs)
         self.current_success_rate = 0.0
-        self.current_target_reached_rate = 0.0
-
-        # Settling state buffers
-        self.settle_buf = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool)
-        self.settle_countdown = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.long)
 
         self._define_shelf_configurations()
         self.current_shelf_config_key_per_env: List[str] = [""] * self.num_envs
@@ -542,8 +529,6 @@ class FrankaShelfEnv(VecEnv):
         self.episode_length_buf[env_ids] = 0
         self.episode_reward_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
-        self.settle_buf[env_ids] = False
-        self.settle_countdown[env_ids] = 0
 
         # Compute and return observations
         self._compute_observations()
@@ -557,49 +542,9 @@ class FrankaShelfEnv(VecEnv):
         dist_to_target_batch = np.linalg.norm(
             ee_pos_batch - self.target_position_world_batch, axis=1)
 
-        target_reached = dist_to_target_batch < self.success_threshold
+        # --- Dones ---
+        terminated_success = dist_to_target_batch < self.success_threshold
 
-        # --- Curriculum Logic ---
-        # Calculate curriculum progress for alive_bonus -> time_penalty
-        transition_start_time = self.success_rate_threshold - self.curriculum_transition_width
-        progress_time = (self.current_success_rate - transition_start_time) / self.curriculum_transition_width
-        time_penalty_scale = np.clip(progress_time, 0.0, 1.0)
-        alive_bonus_scale = 1.0 - time_penalty_scale
-
-        # Calculate curriculum progress for joint_velocity_penalty. This also gates the success definition.
-        transition_start_vel = self.target_reached_rate_threshold - self.curriculum_transition_width
-        progress_vel = (self.current_target_reached_rate - transition_start_vel) / self.curriculum_transition_width
-        joint_vel_penalty_scale = np.clip(progress_vel, 0.0, 1.0)
-        is_hard_phase = joint_vel_penalty_scale > 0.0
-
-        # --- Success & Termination ---
-        # Phase 1: Easy Success (just reach the target, terminate immediately)
-        terminated_easy_success = target_reached & ~is_hard_phase
-        reward_easy_success = self.success_reward * terminated_easy_success.astype(float)
-
-        # Phase 2: Hard Success (reach and settle)
-        # Update settling state only for envs in the hard phase that just reached the target
-        just_reached_target = target_reached & ~self.settle_buf.cpu().numpy()
-        start_settling = just_reached_target & is_hard_phase
-        self.settle_buf[start_settling] = True
-        self.settle_countdown[start_settling] = self.settle_time_in_steps
-
-        # Decrement countdown for environments currently in the settling phase
-        self.settle_countdown[self.settle_buf] -= 1
-
-        # Fail settling if agent moves too far away
-        settling_and_failed = self.settle_buf.cpu().numpy() & ~target_reached
-        self.settle_buf[settling_and_failed] = False
-
-        # Terminate successfully if the settle countdown finishes
-        terminated_hard_success = self.settle_buf.cpu().numpy() & (self.settle_countdown.cpu().numpy() <= 0)
-        reward_hard_success = self.success_reward * terminated_hard_success.astype(float)
-        
-        # Combine success rewards and termination signals
-        reward_success = reward_easy_success + reward_hard_success
-        terminated_by_success = np.logical_or(terminated_easy_success, terminated_hard_success)
-
-        # Other termination conditions
         terminated_collision = np.zeros(self.num_envs, dtype=bool)
         if self.scene and self.scene.is_built and self.franka_entity:
             contacts = self.franka_entity.get_contacts()
@@ -607,46 +552,62 @@ class FrankaShelfEnv(VecEnv):
                 valid_mask = to_numpy(contacts['valid_mask'])
                 terminated_collision = np.any(valid_mask, axis=1)
 
-        terminated = np.logical_or(terminated_collision, terminated_by_success)
+        terminated = np.logical_or(terminated_collision, terminated_success)
         truncated = self.episode_length_buf.cpu().numpy() >= self.max_episode_length
         dones_np = np.logical_or(terminated, truncated)
 
-        # Update success metric buffers
+        # --- Curriculum Logic ---
+        # Update success buffer only with episodes that ran for a minimum number of steps
         done_indices = np.where(dones_np)[0]
         for idx in done_indices:
             if self.episode_length_buf[idx] >= self.min_episode_length_for_success_metric:
-                self.success_buffer.append(terminated_by_success[idx])
-                self.target_reached_buffer.append(target_reached[idx])
+                self.success_buffer.append(terminated_success[idx])
 
-        # Update success rates based on the buffers
+        # Update success rate based on the buffer
         if len(self.success_buffer) > 0:
             self.current_success_rate = np.mean(self.success_buffer)
-        if len(self.target_reached_buffer) > 0:
-            self.current_target_reached_rate = np.mean(self.target_reached_buffer)
+
+        # Calculate curriculum progress (0 to 1) for smooth transition
+        transition_start = self.success_rate_threshold - self.curriculum_transition_width
+        progress = (self.current_success_rate - transition_start) / \
+            self.curriculum_transition_width
+        curriculum_progress = np.clip(progress, 0.0, 1.0)
+
+        time_penalty_scale = curriculum_progress
+        alive_bonus_scale = 1.0 - curriculum_progress
 
         # --- Reward Components ---
         reward_dist = -self.k_dist_reward * dist_to_target_batch
-        penalty_time = -self.k_time_penalty * time_penalty_scale * np.ones(self.num_envs, dtype=np.float32)
-        alive_bonus = self.k_alive_bonus * alive_bonus_scale * np.ones(self.num_envs, dtype=np.float32)
-        penalty_action_mag = -self.k_action_penalty * np.sum(np.square(actions_clipped_batch), axis=1)
-        out_of_bounds = (arm_joint_pos_batch < self.FRANKA_QPOS_LOWER) | (arm_joint_pos_batch > self.FRANKA_QPOS_UPPER)
-        penalty_joint_limit = -self.k_joint_limit_penalty * np.sum(out_of_bounds, axis=1)
-        penalty_collision = -self.k_collision_penalty * terminated_collision.astype(float)
+
+        penalty_time = -self.k_time_penalty * time_penalty_scale * \
+            np.ones(self.num_envs, dtype=np.float32)
+        alive_bonus = self.k_alive_bonus * alive_bonus_scale * \
+            np.ones(self.num_envs, dtype=np.float32)
+
+        penalty_action_mag = -self.k_action_penalty * \
+            np.sum(np.square(actions_clipped_batch), axis=1)
+
+        out_of_bounds = (arm_joint_pos_batch < self.FRANKA_QPOS_LOWER) | (
+            arm_joint_pos_batch > self.FRANKA_QPOS_UPPER)
+        penalty_joint_limit = -self.k_joint_limit_penalty * \
+            np.sum(out_of_bounds, axis=1)
+
+        penalty_collision = -self.k_collision_penalty * \
+            terminated_collision.astype(float)
+
+        reward_success = self.success_reward * terminated_success.astype(float)
 
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
         if self.k_accel_penalty > 0 and self.dt > 0:
             acceleration_sq_sum = np.sum(
-                np.square((arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
+                np.square(
+                    (arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
             penalty_accel = -self.k_accel_penalty * acceleration_sq_sum
-
-        # Velocity penalty only applies during the settling phase of the hard curriculum
-        joint_vel_sq_norm = np.sum(np.square(arm_joint_vel_batch), axis=1)
-        penalty_joint_velocity = -self.k_joint_velocity_penalty * joint_vel_sq_norm * self.settle_buf.cpu().numpy() * joint_vel_penalty_scale
 
         # Total reward
         rewards_np = reward_dist + penalty_time + penalty_action_mag + \
-            penalty_joint_limit + penalty_collision + reward_success + \
-            penalty_accel + alive_bonus + penalty_joint_velocity
+            penalty_joint_limit + penalty_collision + \
+            reward_success + penalty_accel + alive_bonus
         self.rew_buf = torch.from_numpy(rewards_np).to(self.device)
         self.episode_reward_buf += self.rew_buf
 
@@ -655,32 +616,46 @@ class FrankaShelfEnv(VecEnv):
 
         # --- Populate the extras dictionary for logging ---
         self.extras.clear()
-        self.extras["is_success"] = torch.from_numpy(terminated_by_success).to(self.device)
-        self.extras["is_target_reached"] = torch.from_numpy(target_reached).to(self.device)
-        self.extras["dist_to_target"] = torch.from_numpy(dist_to_target_batch).to(self.device)
+        self.extras["is_success"] = torch.from_numpy(
+            terminated_success).to(self.device)
+        self.extras["dist_to_target"] = torch.from_numpy(
+            dist_to_target_batch).to(self.device)
 
         # Add individual reward components
-        self.extras["reward_components/distance"] = torch.from_numpy(reward_dist).to(self.device)
-        self.extras["reward_components/time_penalty"] = torch.from_numpy(penalty_time).to(self.device)
-        self.extras["reward_components/action_penalty"] = torch.from_numpy(penalty_action_mag).to(self.device)
-        self.extras["reward_components/joint_limit_penalty"] = torch.from_numpy(penalty_joint_limit).to(self.device)
-        self.extras["reward_components/collision_penalty"] = torch.from_numpy(penalty_collision).to(self.device)
-        self.extras["reward_components/success_reward"] = torch.from_numpy(reward_success).to(self.device)
-        self.extras["reward_components/accel_penalty"] = torch.from_numpy(penalty_accel).to(self.device)
-        self.extras["reward_components/alive_bonus"] = torch.from_numpy(alive_bonus).to(self.device)
-        self.extras["reward_components/joint_velocity_penalty"] = torch.from_numpy(penalty_joint_velocity).to(self.device)
+        self.extras["reward_components/distance"] = torch.from_numpy(
+            reward_dist).to(self.device)
+        self.extras["reward_components/time_penalty"] = torch.from_numpy(
+            penalty_time).to(self.device)
+        self.extras["reward_components/action_penalty"] = torch.from_numpy(
+            penalty_action_mag).to(self.device)
+        self.extras["reward_components/joint_limit_penalty"] = torch.from_numpy(
+            penalty_joint_limit).to(self.device)
+        self.extras["reward_components/collision_penalty"] = torch.from_numpy(
+            penalty_collision).to(self.device)
+        self.extras["reward_components/success_reward"] = torch.from_numpy(
+            reward_success).to(self.device)
+        self.extras["reward_components/accel_penalty"] = torch.from_numpy(
+            penalty_accel).to(self.device)
+        self.extras["reward_components/alive_bonus"] = torch.from_numpy(
+            alive_bonus).to(self.device)
 
         # Add curriculum info
-        self.extras["curriculum/success_rate"] = torch.tensor(self.current_success_rate, device=self.device)
-        self.extras["curriculum/target_reached_rate"] = torch.tensor(self.current_target_reached_rate, device=self.device)
-        self.extras["curriculum/time_penalty_scale"] = torch.tensor(time_penalty_scale, device=self.device)
-        self.extras["curriculum/alive_bonus_scale"] = torch.tensor(alive_bonus_scale, device=self.device)
-        self.extras["curriculum/joint_vel_penalty_scale"] = torch.tensor(joint_vel_penalty_scale, device=self.device)
+        self.extras["curriculum/success_rate"] = torch.tensor(
+            self.current_success_rate, device=self.device)
+        self.extras["curriculum/progress"] = torch.tensor(
+            curriculum_progress, device=self.device)
+        self.extras["curriculum/time_penalty_scale"] = torch.tensor(
+            time_penalty_scale, device=self.device)
+        self.extras["curriculum/alive_bonus_scale"] = torch.tensor(
+            alive_bonus_scale, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):
             if dones_np[i]:
-                ep_info = {'reward': self.episode_reward_buf[i].item(), 'length': self.episode_length_buf[i].item()}
+                ep_info = {
+                    'reward': self.episode_reward_buf[i].item(),
+                    'length': self.episode_length_buf[i].item()
+                }
                 self.ep_infos.append(ep_info)
 
         # Update prev velocity for next step's acceleration penalty

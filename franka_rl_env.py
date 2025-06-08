@@ -87,10 +87,11 @@ class FrankaShelfEnv(VecEnv):
                      (-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
                  dt: float = 0.01,
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
-                 k_dist_reward: float = 1.0, k_time_penalty: float = 0.01, k_action_penalty: float = 0.001,
+                 k_dist_reward: float = 1.0, k_action_penalty: float = 0.001,
                  k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
-                 k_accel_penalty: float = 0.0, k_alive_bonus: float = 0.0,
+                 k_accel_penalty: float = 0.0,
                  success_reward_val: float = 200.0, success_threshold_val: float = 0.05,
+                 k_success_vel_penalty: float = 2.5,
                  success_rate_threshold: float = 0.7,
                  curriculum_transition_width: float = 0.2,
                  min_episode_length_for_success_metric: int = 10,
@@ -127,10 +128,10 @@ class FrankaShelfEnv(VecEnv):
         self.workspace_bounds_x, self.workspace_bounds_y, self.workspace_bounds_z = workspace_bounds_xyz
         self.dt = dt
         self.franka_xml_path = franka_xml_path
-        self.k_dist_reward, self.k_time_penalty, self.k_action_penalty = k_dist_reward, k_time_penalty, k_action_penalty
+        self.k_dist_reward, self.k_action_penalty = k_dist_reward, k_action_penalty
         self.k_joint_limit_penalty, self.k_collision_penalty, self.k_accel_penalty = k_joint_limit_penalty, k_collision_penalty, k_accel_penalty
-        self.k_alive_bonus = k_alive_bonus
         self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
+        self.k_success_vel_penalty = k_success_vel_penalty
 
         # Curriculum learning attributes
         self.success_rate_threshold = success_rate_threshold
@@ -567,22 +568,15 @@ class FrankaShelfEnv(VecEnv):
         if len(self.success_buffer) > 0:
             self.current_success_rate = np.mean(self.success_buffer)
 
-        # Calculate curriculum progress (0 to 1) for smooth transition
+        # Calculate curriculum progress (0 to 1) for smooth transition.
+        # This progress factor will scale the velocity penalty.
         transition_start = self.success_rate_threshold - self.curriculum_transition_width
         progress = (self.current_success_rate - transition_start) / \
             self.curriculum_transition_width
         curriculum_progress = np.clip(progress, 0.0, 1.0)
 
-        time_penalty_scale = curriculum_progress
-        alive_bonus_scale = 1.0 - curriculum_progress
-
         # --- Reward Components ---
         reward_dist = -self.k_dist_reward * dist_to_target_batch
-
-        penalty_time = -self.k_time_penalty * time_penalty_scale * \
-            np.ones(self.num_envs, dtype=np.float32)
-        alive_bonus = self.k_alive_bonus * alive_bonus_scale * \
-            np.ones(self.num_envs, dtype=np.float32)
 
         penalty_action_mag = -self.k_action_penalty * \
             np.sum(np.square(actions_clipped_batch), axis=1)
@@ -595,7 +589,19 @@ class FrankaShelfEnv(VecEnv):
         penalty_collision = -self.k_collision_penalty * \
             terminated_collision.astype(float)
 
-        reward_success = self.success_reward * terminated_success.astype(float)
+        # The success velocity penalty is now scaled by the curriculum progress.
+        # It only kicks in after the agent achieves a certain base success rate.
+        scaled_success_vel_penalty = self.k_success_vel_penalty * curriculum_progress
+
+        joint_vel_magnitude = np.linalg.norm(arm_joint_vel_batch, axis=1)
+
+        # The modulation factor is now based on the scaled penalty.
+        # If curriculum_progress is 0, scaled_penalty is 0, modulation is 1 (no penalty).
+        velocity_reward_modulation = np.exp(-scaled_success_vel_penalty * joint_vel_magnitude)
+
+        # Apply this modulation only when the success condition is met.
+        reward_success = self.success_reward * \
+            terminated_success.astype(float) * velocity_reward_modulation
 
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
         if self.k_accel_penalty > 0 and self.dt > 0:
@@ -605,9 +611,9 @@ class FrankaShelfEnv(VecEnv):
             penalty_accel = -self.k_accel_penalty * acceleration_sq_sum
 
         # Total reward
-        rewards_np = reward_dist + penalty_time + penalty_action_mag + \
+        rewards_np = reward_dist + penalty_action_mag + \
             penalty_joint_limit + penalty_collision + \
-            reward_success + penalty_accel + alive_bonus
+            reward_success + penalty_accel
         self.rew_buf = torch.from_numpy(rewards_np).to(self.device)
         self.episode_reward_buf += self.rew_buf
 
@@ -624,8 +630,6 @@ class FrankaShelfEnv(VecEnv):
         # Add individual reward components
         self.extras["reward_components/distance"] = torch.from_numpy(
             reward_dist).to(self.device)
-        self.extras["reward_components/time_penalty"] = torch.from_numpy(
-            penalty_time).to(self.device)
         self.extras["reward_components/action_penalty"] = torch.from_numpy(
             penalty_action_mag).to(self.device)
         self.extras["reward_components/joint_limit_penalty"] = torch.from_numpy(
@@ -634,20 +638,18 @@ class FrankaShelfEnv(VecEnv):
             penalty_collision).to(self.device)
         self.extras["reward_components/success_reward"] = torch.from_numpy(
             reward_success).to(self.device)
+        self.extras["reward_components/velocity_reward_modulation"] = torch.from_numpy(
+            velocity_reward_modulation).to(self.device)
         self.extras["reward_components/accel_penalty"] = torch.from_numpy(
             penalty_accel).to(self.device)
-        self.extras["reward_components/alive_bonus"] = torch.from_numpy(
-            alive_bonus).to(self.device)
 
         # Add curriculum info
         self.extras["curriculum/success_rate"] = torch.tensor(
             self.current_success_rate, device=self.device)
         self.extras["curriculum/progress"] = torch.tensor(
             curriculum_progress, device=self.device)
-        self.extras["curriculum/time_penalty_scale"] = torch.tensor(
-            time_penalty_scale, device=self.device)
-        self.extras["curriculum/alive_bonus_scale"] = torch.tensor(
-            alive_bonus_scale, device=self.device)
+        self.extras["curriculum/scaled_success_vel_penalty"] = torch.tensor(
+            scaled_success_vel_penalty, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):

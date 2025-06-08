@@ -165,8 +165,9 @@ class CustomOnPolicyRunner(OnPolicyRunner):
 
         # Bookkeeping for custom reward component logging
         reward_component_names = [
-            "distance", "time_penalty", "action_penalty", "joint_limit_penalty",
-            "collision_penalty", "success_reward", "accel_penalty", "alive_bonus"
+            "distance", "action_penalty", "joint_limit_penalty",
+            "collision_penalty", "success_reward", "accel_penalty",
+            "velocity_reward_modulation"
         ]
         reward_component_buffers = {name: deque(
             maxlen=100) for name in reward_component_names}
@@ -286,12 +287,12 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                 if "curriculum/success_rate" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Success Rate", infos["curriculum/success_rate"].item(), it)
-                if "curriculum/time_penalty_scale" in infos:
+                if "curriculum/progress" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Time Penalty Scale", infos["curriculum/time_penalty_scale"].item(), it)
-                if "curriculum/alive_bonus_scale" in infos:
+                        "Curriculum/Progress", infos["curriculum/progress"].item(), it)
+                if "curriculum/scaled_success_vel_penalty" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Alive Bonus Scale", infos["curriculum/alive_bonus_scale"].item(), it)
+                        "Curriculum/Scaled Success Velocity Penalty", infos["curriculum/scaled_success_vel_penalty"].item(), it)
 
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
@@ -318,19 +319,18 @@ class EnvConfig:
 
     # Environment-specific parameters, passed to FrankaShelfEnv constructor
     k_dist_reward: float = 1.0
-    k_time_penalty: float = 0.5
     k_action_penalty: float = 0.0005
     k_joint_limit_penalty: float = 5.0
     k_collision_penalty: float = 20.0
     k_accel_penalty: float = 0.0001
-    k_alive_bonus: float = 0.1
     success_reward_val: float = 300.0
     success_threshold_val: float = 0.05
+    k_success_vel_penalty: float = 2.5
 
-    # Curriculum Learning Parameters
-    success_rate_threshold: float = 1.0
-    # e.g., transition from success_rate_threshold - curriculum_transition_width to success_rate_threshold success rate
-    curriculum_transition_width: float = 0.01  # basically off
+    # Curriculum Learning Parameters for velocity penalty
+    success_rate_threshold: float = 0.9
+    # Penalty begins to apply at (threshold - width) and is fully applied at threshold
+    curriculum_transition_width: float = 0.2
     min_episode_length_for_success_metric: int = 10
 
     include_shelf: bool = False
@@ -484,14 +484,13 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "num_envs": cfg.env.num_envs,
             "max_steps_per_episode": cfg.env.max_episode_length,
             "k_dist_reward": cfg.env.k_dist_reward,
-            "k_time_penalty": cfg.env.k_time_penalty,
             "k_action_penalty": cfg.env.k_action_penalty,
             "k_joint_limit_penalty": cfg.env.k_joint_limit_penalty,
             "k_collision_penalty": cfg.env.k_collision_penalty,
             "k_accel_penalty": cfg.env.k_accel_penalty,
-            "k_alive_bonus": cfg.env.k_alive_bonus,
             "success_reward_val": cfg.env.success_reward_val,
             "success_threshold_val": cfg.env.success_threshold_val,
+            "k_success_vel_penalty": cfg.env.k_success_vel_penalty,
             "success_rate_threshold": cfg.env.success_rate_threshold,
             "curriculum_transition_width": cfg.env.curriculum_transition_width,
             "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,

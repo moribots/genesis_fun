@@ -22,6 +22,8 @@ from scipy.spatial.transform import Rotation as ScipyRotation
 import genesis as gs  # type: ignore
 from rsl_rl.env import VecEnv
 
+from curriculum import LinearCurriculum, CurriculumConfig
+
 
 def to_numpy(data: Union[torch.Tensor, np.ndarray, List, Tuple]) -> np.ndarray:
     """
@@ -90,10 +92,9 @@ class FrankaShelfEnv(VecEnv):
                  k_dist_reward: float = 1.0, k_action_penalty: float = 0.001,
                  k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
                  k_accel_penalty: float = 0.0,
-                 success_reward_val: float = 200.0, success_threshold_val: float = 0.05,
-                 k_success_vel_penalty: float = 2.5,
-                 success_rate_threshold: float = 0.7,
-                 curriculum_transition_width: float = 0.2,
+                 success_reward_val: float = 200.0,
+                 threshold_curriculum_cfg: dict = None,
+                 velocity_penalty_curriculum_cfg: dict = None,
                  min_episode_length_for_success_metric: int = 10,
                  video_camera_pos: Tuple[float,
                                          float, float] = (1.8, -1.8, 2.0),
@@ -130,12 +131,18 @@ class FrankaShelfEnv(VecEnv):
         self.franka_xml_path = franka_xml_path
         self.k_dist_reward, self.k_action_penalty = k_dist_reward, k_action_penalty
         self.k_joint_limit_penalty, self.k_collision_penalty, self.k_accel_penalty = k_joint_limit_penalty, k_collision_penalty, k_accel_penalty
-        self.success_reward, self.success_threshold = success_reward_val, success_threshold_val
-        self.k_success_vel_penalty = k_success_vel_penalty
+        self.success_reward = success_reward_val
 
-        # Curriculum learning attributes
-        self.success_rate_threshold = success_rate_threshold
-        self.curriculum_transition_width = curriculum_transition_width
+        # --- Initialize Curriculum Components ---
+        if threshold_curriculum_cfg is None or velocity_penalty_curriculum_cfg is None:
+            raise ValueError(
+                "Curriculum configurations must be provided.")
+
+        self.threshold_curriculum = LinearCurriculum(
+            CurriculumConfig(**threshold_curriculum_cfg))
+        self.velocity_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**velocity_penalty_curriculum_cfg))
+
         self.min_episode_length_for_success_metric = min_episode_length_for_success_metric
         self.success_buffer = deque(maxlen=100 * self.num_envs)
         self.current_success_rate = 0.0
@@ -401,16 +408,18 @@ class FrankaShelfEnv(VecEnv):
 
     def _draw_target_spheres(self):
         """Draws the target spheres in the simulation viewer."""
+        # Use the current success threshold from the curriculum to set the radius
+        # of the visual target sphere, so we can see the goal shrinking.
+        current_radius = self.threshold_curriculum.current_value
+
         if (self.render or self._is_recording) and self.scene:
             if self.num_envs == 1:
                 # If there's only one environment, draw a single debug sphere.
-                # This is useful for clarity when testing with a single instance.
                 points_to_draw = [self.target_position_world_batch[0].tolist()]
                 self.scene.draw_debug_spheres(
-                    points_to_draw, radius=0.03, color=(0.0, 1.0, 0.0, 0.8))
+                    points_to_draw, radius=current_radius, color=(0.0, 1.0, 0.0, 0.8))
             elif self.num_envs > 1 and self.target_sphere_entity_type is not None:
-                # For multiple environments, update the positions of the batched sphere entity.
-                # This is more efficient than drawing individual debug spheres for each environment.
+                # For multiple environments, update the positions and radius.
                 target_pos_tensor = torch.from_numpy(
                     self.target_position_world_batch).to(self.device, dtype=torch.float32)
                 self.target_sphere_entity_type.set_pos(target_pos_tensor)
@@ -543,8 +552,22 @@ class FrankaShelfEnv(VecEnv):
         dist_to_target_batch = np.linalg.norm(
             ee_pos_batch - self.target_position_world_batch, axis=1)
 
+        # --- Curriculum Update ---
+        # Update success rate based on the buffer.
+        if len(self.success_buffer) > 0:
+            self.current_success_rate = np.mean(self.success_buffer)
+
+        # Update each curriculum component with the current success rate.
+        self.threshold_curriculum.update(self.current_success_rate)
+        self.velocity_penalty_curriculum.update(self.current_success_rate)
+
+        # Get the current values from the curriculum objects.
+        current_success_threshold = self.threshold_curriculum.current_value
+        current_vel_penalty = self.velocity_penalty_curriculum.current_value
+
         # --- Dones ---
-        terminated_success = dist_to_target_batch < self.success_threshold
+        # The success condition now uses the dynamic threshold from the curriculum.
+        terminated_success = dist_to_target_batch < current_success_threshold
 
         terminated_collision = np.zeros(self.num_envs, dtype=bool)
         if self.scene and self.scene.is_built and self.franka_entity:
@@ -557,23 +580,11 @@ class FrankaShelfEnv(VecEnv):
         truncated = self.episode_length_buf.cpu().numpy() >= self.max_episode_length
         dones_np = np.logical_or(terminated, truncated)
 
-        # --- Curriculum Logic ---
-        # Update success buffer only with episodes that ran for a minimum number of steps
+        # Update success buffer for the next iteration's curriculum calculation.
         done_indices = np.where(dones_np)[0]
         for idx in done_indices:
             if self.episode_length_buf[idx] >= self.min_episode_length_for_success_metric:
                 self.success_buffer.append(terminated_success[idx])
-
-        # Update success rate based on the buffer
-        if len(self.success_buffer) > 0:
-            self.current_success_rate = np.mean(self.success_buffer)
-
-        # Calculate curriculum progress (0 to 1) for smooth transition.
-        # This progress factor will scale the velocity penalty.
-        transition_start = self.success_rate_threshold - self.curriculum_transition_width
-        progress = (self.current_success_rate - transition_start) / \
-            self.curriculum_transition_width
-        curriculum_progress = np.clip(progress, 0.0, 1.0)
 
         # --- Reward Components ---
         reward_dist = -self.k_dist_reward * dist_to_target_batch
@@ -589,15 +600,11 @@ class FrankaShelfEnv(VecEnv):
         penalty_collision = -self.k_collision_penalty * \
             terminated_collision.astype(float)
 
-        # The success velocity penalty is now scaled by the curriculum progress.
-        # It only kicks in after the agent achieves a certain base success rate.
-        scaled_success_vel_penalty = self.k_success_vel_penalty * curriculum_progress
-
         joint_vel_magnitude = np.linalg.norm(arm_joint_vel_batch, axis=1)
 
-        # The modulation factor is now based on the scaled penalty.
-        # If curriculum_progress is 0, scaled_penalty is 0, modulation is 1 (no penalty).
-        velocity_reward_modulation = np.exp(-scaled_success_vel_penalty * joint_vel_magnitude)
+        # The modulation factor uses the velocity penalty from the curriculum.
+        velocity_reward_modulation = np.exp(
+            -current_vel_penalty * joint_vel_magnitude)
 
         # Apply this modulation only when the success condition is met.
         reward_success = self.success_reward * \
@@ -643,13 +650,17 @@ class FrankaShelfEnv(VecEnv):
         self.extras["reward_components/accel_penalty"] = torch.from_numpy(
             penalty_accel).to(self.device)
 
-        # Add curriculum info
-        self.extras["curriculum/success_rate"] = torch.tensor(
+        # Add curriculum info for logging
+        self.extras["curriculum/overall_success_rate"] = torch.tensor(
             self.current_success_rate, device=self.device)
-        self.extras["curriculum/progress"] = torch.tensor(
-            curriculum_progress, device=self.device)
-        self.extras["curriculum/scaled_success_vel_penalty"] = torch.tensor(
-            scaled_success_vel_penalty, device=self.device)
+        self.extras["curriculum/threshold_value"] = torch.tensor(
+            self.threshold_curriculum.current_value, device=self.device)
+        self.extras["curriculum/threshold_progress"] = torch.tensor(
+            self.threshold_curriculum.progress, device=self.device)
+        self.extras["curriculum/velocity_penalty_value"] = torch.tensor(
+            self.velocity_penalty_curriculum.current_value, device=self.device)
+        self.extras["curriculum/velocity_penalty_progress"] = torch.tensor(
+            self.velocity_penalty_curriculum.progress, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):
@@ -690,7 +701,7 @@ class FrankaShelfEnv(VecEnv):
         # Handle resets for environments that have finished their episode
         env_ids_to_reset = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids_to_reset) > 0:
-            # Note: Target positions are only randomized inside reset_idx, not every step
+            # Target positions and sphere radii are updated inside reset_idx
             self.reset_idx(to_numpy(env_ids_to_reset))
 
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
@@ -731,12 +742,29 @@ if __name__ == '__main__':
             f"CRITICAL ERROR: Failed to initialize Genesis for testing: {e_init}\nExiting.")
         sys.exit(1)
 
+    # --- Test Configuration ---
+    # This setup mirrors the structure in train_agent.py for consistency.
+    test_threshold_curriculum_cfg = {
+        'start_value': 0.05,
+        'end_value': 0.005,
+        'start_metric_val': 0.4,
+        'end_metric_val': 0.8
+    }
+    test_velocity_penalty_curriculum_cfg = {
+        'start_value': 0.0,
+        'end_value': 2.5,
+        'start_metric_val': 0.4,
+        'end_metric_val': 0.8
+    }
+
     num_test_envs_for_run = 5
     print(f"\n\n--- TESTING WITH NUM_ENVS = {num_test_envs_for_run} ---")
     env = None
     try:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         env = FrankaShelfEnv(num_envs=num_test_envs_for_run,
+                             threshold_curriculum_cfg=test_threshold_curriculum_cfg,
+                             velocity_penalty_curriculum_cfg=test_velocity_penalty_curriculum_cfg,
                              include_shelf=False,
                              randomize_shelf_config=False,
                              device=device,
@@ -754,12 +782,19 @@ if __name__ == '__main__':
 
         print("\nRunning a short loop with random actions...")
         for step_num in range(5000):
+            # Manually advance the success rate for testing the curriculum
+            if step_num > 0 and step_num % 100 == 0:
+                # Simulate a successful episode to drive the curriculum forward
+                env.success_buffer.append(True)
+
             actions = torch.rand(
                 env.num_envs, env.num_actions, device=device) * 2 - 1
             obs, _, rewards, dones, infos = env.step(actions)
-            if (step_num + 1) % 10 == 0:
+            if (step_num + 1) % 50 == 0:
                 print(
-                    f"Step {step_num+1}: rewards mean: {rewards.mean().item():.2f}, dones: {dones.sum().item()}")
+                    f"Step {step_num+1}: Success Rate: {infos['curriculum/overall_success_rate']:.2f} | "
+                    f"Threshold: {infos['curriculum/threshold_value']:.4f} | "
+                    f"Vel Penalty: {infos['curriculum/velocity_penalty_value']:.2f}")
 
         print("\nBasic test loop finished.")
 

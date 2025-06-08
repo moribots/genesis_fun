@@ -25,6 +25,7 @@ import imageio
 import wandb
 
 from franka_rl_env import FrankaShelfEnv
+from curriculum import CurriculumConfig
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.modules import ActorCritic
 from rsl_rl.algorithms import PPO
@@ -283,16 +284,22 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                     self.writer.add_scalar(
                         "Rollout/length_max", max(iteration_episode_lengths), it)
 
-                # Log curriculum-related info from the env's `extras` dict (now in `infos`)
-                if "curriculum/success_rate" in infos:
+                # Log curriculum-related info from the env's `extras` dict
+                if "curriculum/overall_success_rate" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Success Rate", infos["curriculum/success_rate"].item(), it)
-                if "curriculum/progress" in infos:
+                        "Curriculum/Overall Success Rate", infos["curriculum/overall_success_rate"].item(), it)
+                if "curriculum/threshold_value" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Progress", infos["curriculum/progress"].item(), it)
-                if "curriculum/scaled_success_vel_penalty" in infos:
+                        "Curriculum/Threshold/Value", infos["curriculum/threshold_value"].item(), it)
+                if "curriculum/threshold_progress" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Scaled Success Velocity Penalty", infos["curriculum/scaled_success_vel_penalty"].item(), it)
+                        "Curriculum/Threshold/Progress", infos["curriculum/threshold_progress"].item(), it)
+                if "curriculum/velocity_penalty_value" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Velocity_Penalty/Value", infos["curriculum/velocity_penalty_value"].item(), it)
+                if "curriculum/velocity_penalty_progress" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Velocity_Penalty/Progress", infos["curriculum/velocity_penalty_progress"].item(), it)
 
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
@@ -318,20 +325,27 @@ class EnvConfig:
     seed: int = 42
 
     # Environment-specific parameters, passed to FrankaShelfEnv constructor
-    k_dist_reward: float = 1.0
+    k_dist_reward: float = 2.0
     k_action_penalty: float = 0.0005
     k_joint_limit_penalty: float = 5.0
     k_collision_penalty: float = 20.0
     k_accel_penalty: float = 0.0001
     success_reward_val: float = 300.0
-    success_threshold_val: float = 0.05
-    k_success_vel_penalty: float = 2.5
-
-    # Curriculum Learning Parameters for velocity penalty
-    success_rate_threshold: float = 0.9
-    # Penalty begins to apply at (threshold - width) and is fully applied at threshold
-    curriculum_transition_width: float = 0.2
     min_episode_length_for_success_metric: int = 10
+
+    # Modular Curriculum Configurations
+    threshold_curriculum: CurriculumConfig = CurriculumConfig(
+        start_value=0.05,     # Start at 5cm tolerance
+        end_value=0.005,      # End at 5mm tolerance
+        start_metric_val=0.6,  # Begin tightening
+        end_metric_val=0.84    # Finish tightening
+    )
+    velocity_penalty_curriculum: CurriculumConfig = CurriculumConfig(
+        start_value=0.0,      # Start with no velocity penalty
+        end_value=0.5,        # End with full velocity penalty
+        start_metric_val=0.85,  # Begin applying penalty
+        end_metric_val=0.95    # Apply full penalty
+    )
 
     include_shelf: bool = False
     randomize_shelf_config: bool = True
@@ -382,7 +396,7 @@ class RunnerConfig:
     # --- General ---
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed: int = 42
-    max_iterations: int = 2001
+    max_iterations: int = 3001
 
     # --- Runner-specific parameters for RSL-RL ---
     empirical_normalization: bool = True
@@ -397,7 +411,7 @@ class RunnerConfig:
     checkpoint_path: str = ""  # path to checkpoint
 
     # --- Video Logging ---
-    video_log_interval: int = 500  # log video every 1000 iterations
+    video_log_interval: int = 250  # log video every 1000 iterations
     video_length: int = 300  # steps to record in video
 
     # --- W&B Integration ---
@@ -489,10 +503,8 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "k_collision_penalty": cfg.env.k_collision_penalty,
             "k_accel_penalty": cfg.env.k_accel_penalty,
             "success_reward_val": cfg.env.success_reward_val,
-            "success_threshold_val": cfg.env.success_threshold_val,
-            "k_success_vel_penalty": cfg.env.k_success_vel_penalty,
-            "success_rate_threshold": cfg.env.success_rate_threshold,
-            "curriculum_transition_width": cfg.env.curriculum_transition_width,
+            "threshold_curriculum_cfg": asdict(cfg.env.threshold_curriculum),
+            "velocity_penalty_curriculum_cfg": asdict(cfg.env.velocity_penalty_curriculum),
             "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,
             "include_shelf": cfg.env.include_shelf,
             "randomize_shelf_config": cfg.env.randomize_shelf_config,

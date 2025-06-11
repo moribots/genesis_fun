@@ -12,7 +12,7 @@ This script handles:
 import os
 import sys
 import traceback
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields, field
 import time
 from collections import deque
 import numpy as np
@@ -62,9 +62,9 @@ class CustomOnPolicyRunner(OnPolicyRunner):
         }
         # Add all fields from the RunnerConfig dataclass to the top level of the dictionary.
         # This will include 'wandb_entity' and 'wandb_project', which are needed by WandbSummaryWriter.
-        for field in fields(train_cfg.runner):
-            runner_internal_cfg[field.name] = getattr(
-                train_cfg.runner, field.name)
+        for f in fields(train_cfg.runner):
+            runner_internal_cfg[f.name] = getattr(
+                train_cfg.runner, f.name)
 
         # Call the parent constructor with the explicitly constructed dictionary
         super().__init__(env, runner_internal_cfg, log_dir, device)
@@ -168,7 +168,7 @@ class CustomOnPolicyRunner(OnPolicyRunner):
         reward_component_names = [
             "distance", "action_penalty", "joint_limit_penalty",
             "collision_penalty", "success_reward", "accel_penalty",
-            "velocity_reward_modulation"
+            "velocity_reward_modulation", "upright_bonus"
         ]
         reward_component_buffers = {name: deque(
             maxlen=100) for name in reward_component_names}
@@ -291,15 +291,18 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                 if "curriculum/threshold_value" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Threshold/Value", infos["curriculum/threshold_value"].item(), it)
-                if "curriculum/threshold_progress" in infos:
-                    self.writer.add_scalar(
-                        "Curriculum/Threshold/Progress", infos["curriculum/threshold_progress"].item(), it)
                 if "curriculum/velocity_penalty_value" in infos:
                     self.writer.add_scalar(
                         "Curriculum/Velocity_Penalty/Value", infos["curriculum/velocity_penalty_value"].item(), it)
-                if "curriculum/velocity_penalty_progress" in infos:
+                if "curriculum/action_penalty_value" in infos:
                     self.writer.add_scalar(
-                        "Curriculum/Velocity_Penalty/Progress", infos["curriculum/velocity_penalty_progress"].item(), it)
+                        "Curriculum/Action_Penalty/Value", infos["curriculum/action_penalty_value"].item(), it)
+                if "curriculum/accel_penalty_value" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Accel_Penalty/Value", infos["curriculum/accel_penalty_value"].item(), it)
+                if "curriculum/upright_bonus_value" in infos:
+                    self.writer.add_scalar(
+                        "Curriculum/Upright_Bonus/Value", infos["curriculum/upright_bonus_value"].item(), it)
 
             # Checkpoint saving
             if self.save_interval > 0 and (it % self.save_interval == 0):
@@ -321,31 +324,72 @@ class EnvConfig:
     num_obs: int = 24  # robot_state (21) + relative_target (3)
     num_privileged_obs: int = 0
     num_actions: int = 7
-    max_episode_length: int = 300
+    max_episode_length: int = 600
     seed: int = 42
 
-    # Environment-specific parameters, passed to FrankaShelfEnv constructor
-    k_dist_reward: float = 2.0
-    k_action_penalty: float = 0.0005
-    k_joint_limit_penalty: float = 5.0
-    k_collision_penalty: float = 20.0
-    k_accel_penalty: float = 0.0001
+    # --- Control and Simulation Parameters ---
+    control_mode: str = 'torque'  # 'velocity' or 'torque'
+    dt: float = 0.005
+    # --- Base Reward Coefficients (placeholders, will be overridden) ---
+    k_dist_reward: float = 0.0
+    k_joint_limit_penalty: float = 0.0
+    k_collision_penalty: float = 0.0
     success_reward_val: float = 300.0
     min_episode_length_for_success_metric: int = 10
 
-    # Modular Curriculum Configurations
-    threshold_curriculum: CurriculumConfig = CurriculumConfig(
-        start_value=0.05,     # Start at 5cm tolerance
-        end_value=0.005,      # End at 5mm tolerance
-        start_metric_val=0.6,  # Begin tightening
-        end_metric_val=0.84    # Finish tightening
-    )
-    velocity_penalty_curriculum: CurriculumConfig = CurriculumConfig(
-        start_value=0.0,      # Start with no velocity penalty
-        end_value=0.5,        # End with full velocity penalty
-        start_metric_val=0.85,  # Begin applying penalty
-        end_metric_val=0.95    # Apply full penalty
-    )
+    # Modular Curriculum Configurations (placeholders)
+    threshold_curriculum: CurriculumConfig = field(default_factory=dict)
+    velocity_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    action_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    accel_penalty_curriculum: CurriculumConfig = field(default_factory=dict)
+    upright_bonus_curriculum: CurriculumConfig = field(default_factory=dict)
+
+    def __post_init__(self):
+        """
+        Dynamically sets reward coefficients and curricula based on the selected control mode.
+        This allows for maintaining a well-tuned set of parameters for the simpler
+        velocity control task, while providing a more suitable, less punishing reward
+        structure for the more challenging torque control task.
+        """
+        if self.control_mode == 'velocity':
+            self.k_dist_reward = 2.0
+            self.k_joint_limit_penalty = 5.0
+            self.k_collision_penalty = 20.0
+
+            # For velocity control, penalties are constant and there is no upright bonus.
+            # We use the curriculum object with identical start/end values.
+            self.action_penalty_curriculum = CurriculumConfig(
+                start_value=0.0005, end_value=0.0005, start_metric_val=0.0, end_metric_val=1.0)
+            self.accel_penalty_curriculum = CurriculumConfig(
+                start_value=0.0001, end_value=0.0001, start_metric_val=0.0, end_metric_val=1.0)
+            self.upright_bonus_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.0, start_metric_val=0.0, end_metric_val=1.0)
+
+            # The main curriculum for velocity control focuses on precision and stopping.
+            self.threshold_curriculum = CurriculumConfig(
+                start_value=0.05, end_value=0.005, start_metric_val=0.7, end_metric_val=0.9)
+            self.velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=1.5, start_metric_val=0.85, end_metric_val=0.95)
+
+        elif self.control_mode == 'torque':
+            self.k_dist_reward = 2.5
+            self.k_joint_limit_penalty = 5.0
+            self.k_collision_penalty = 20.0
+
+            # For torque control, penalties and bonuses are gradually introduced/removed.
+            self.action_penalty_curriculum = CurriculumConfig(
+                start_value=1.0e-5, end_value=1.0e-4, start_metric_val=0.5, end_metric_val=0.8)
+            self.accel_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=5.0e-5, start_metric_val=0.5, end_metric_val=0.8)
+            # The upright bonus starts high and decays as the agent learns.
+            self.upright_bonus_curriculum = CurriculumConfig(
+                start_value=1.0, end_value=0.0, start_metric_val=0.0, end_metric_val=0.4)
+
+            # The main curriculum is also adjusted for the harder task.
+            self.threshold_curriculum = CurriculumConfig(
+                start_value=0.05, end_value=0.005, start_metric_val=0.6, end_metric_val=0.84)
+            self.velocity_penalty_curriculum = CurriculumConfig(
+                start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
 
     include_shelf: bool = False
     randomize_shelf_config: bool = True
@@ -396,7 +440,7 @@ class RunnerConfig:
     # --- General ---
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed: int = 42
-    max_iterations: int = 3001
+    max_iterations: int = 4001
 
     # --- Runner-specific parameters for RSL-RL ---
     empirical_normalization: bool = True
@@ -411,8 +455,8 @@ class RunnerConfig:
     checkpoint_path: str = ""  # path to checkpoint
 
     # --- Video Logging ---
-    video_log_interval: int = 250  # log video every 1000 iterations
-    video_length: int = 300  # steps to record in video
+    video_log_interval: int = 250
+    video_length: int = 600
 
     # --- W&B Integration ---
     wandb: bool = True
@@ -498,13 +542,14 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "num_envs": cfg.env.num_envs,
             "max_steps_per_episode": cfg.env.max_episode_length,
             "k_dist_reward": cfg.env.k_dist_reward,
-            "k_action_penalty": cfg.env.k_action_penalty,
             "k_joint_limit_penalty": cfg.env.k_joint_limit_penalty,
             "k_collision_penalty": cfg.env.k_collision_penalty,
-            "k_accel_penalty": cfg.env.k_accel_penalty,
             "success_reward_val": cfg.env.success_reward_val,
             "threshold_curriculum_cfg": asdict(cfg.env.threshold_curriculum),
             "velocity_penalty_curriculum_cfg": asdict(cfg.env.velocity_penalty_curriculum),
+            "action_penalty_curriculum_cfg": asdict(cfg.env.action_penalty_curriculum),
+            "accel_penalty_curriculum_cfg": asdict(cfg.env.accel_penalty_curriculum),
+            "upright_bonus_curriculum_cfg": asdict(cfg.env.upright_bonus_curriculum),
             "min_episode_length_for_success_metric": cfg.env.min_episode_length_for_success_metric,
             "include_shelf": cfg.env.include_shelf,
             "randomize_shelf_config": cfg.env.randomize_shelf_config,
@@ -514,8 +559,11 @@ def run_franka_training(cfg: TrainConfig) -> None:
             "video_camera_fov": cfg.env.video_camera_fov,
             "video_res": cfg.env.video_res,
             "device": cfg.runner.device,
-            "seed": cfg.env.seed
+            "seed": cfg.env.seed,
+            "dt": cfg.env.dt,
+            "control_mode": cfg.env.control_mode
         }
+
         env = FrankaShelfEnv(**env_kwargs)
         print("FrankaShelfEnv created successfully.")
 

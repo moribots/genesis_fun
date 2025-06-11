@@ -4,7 +4,7 @@ for a Franka Emika Panda robot, adapted for the RSL-RL library.
 
 The environment involves tasks like reaching specific poses. The observation
 space is a flattened tensor including robot state and target position.
-The action space is continuous joint velocity control.
+The action space can be configured for either velocity or torque control.
 It uses the Genesis simulation engine for physics and rendering.
 """
 import os
@@ -39,8 +39,9 @@ class FrankaShelfEnv(VecEnv):
     """
     A vectorized environment for a Franka Emika Panda robot, adapted for RSL-RL.
     Observations are a flattened tensor of robot state and relative target position.
-    Actions are continuous joint velocity commands.
+    Actions are continuous joint velocity or torque commands.
     """
+    # https://frankaemika.github.io/docs/control_parameters.html
     FRANKA_JOINT_NAMES: List[str] = ['joint1', 'joint2', 'joint3', 'joint4',
                                      'joint5', 'joint6', 'joint7', 'finger_joint1', 'finger_joint2']
     FRANKA_NUM_ARM_JOINTS: int = 7
@@ -53,6 +54,8 @@ class FrankaShelfEnv(VecEnv):
         [2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973], dtype=np.float32)
     FRANKA_VEL_LIMIT: np.ndarray = np.array(
         [2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100], dtype=np.float32)
+    FRANKA_TORQUE_LIMIT: np.ndarray = np.array(
+        [87, 87, 87, 87, 12, 12, 12], dtype=np.float32)
     ROBOT_EE_LINK_NAME: str = "hand"
 
     FRANKA_QPOS_RESET_NOISE_RANGES: np.ndarray = np.array([
@@ -88,13 +91,17 @@ class FrankaShelfEnv(VecEnv):
                  workspace_bounds_xyz: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
                      (-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
                  dt: float = 0.01,
+                 control_mode: str = 'velocity',
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
-                 k_dist_reward: float = 1.0, k_action_penalty: float = 0.001,
-                 k_joint_limit_penalty: float = 10.0, k_collision_penalty: float = 100.0,
-                 k_accel_penalty: float = 0.0,
+                 k_dist_reward: float = 1.0,
+                 k_joint_limit_penalty: float = 10.0,
+                 k_collision_penalty: float = 100.0,
                  success_reward_val: float = 200.0,
                  threshold_curriculum_cfg: dict = None,
                  velocity_penalty_curriculum_cfg: dict = None,
+                 action_penalty_curriculum_cfg: dict = None,
+                 accel_penalty_curriculum_cfg: dict = None,
+                 upright_bonus_curriculum_cfg: dict = None,
                  min_episode_length_for_success_metric: int = 10,
                  video_camera_pos: Tuple[float,
                                          float, float] = (1.8, -1.8, 2.0),
@@ -116,6 +123,12 @@ class FrankaShelfEnv(VecEnv):
         self.include_shelf = include_shelf
         self.randomize_shelf_config = randomize_shelf_config
 
+        # --- Control Mode Selection ---
+        self.control_mode = control_mode
+        if self.control_mode not in ['velocity', 'torque']:
+            raise ValueError(
+                f"Invalid control_mode: {self.control_mode}. Must be 'velocity' or 'torque'.")
+
         # RSL-RL specific attributes
         robot_state_flat_dim = self.FRANKA_NUM_ARM_JOINTS * \
             2 + 3 + 4  # qpos, qvel, ee_pos, ee_quat
@@ -129,19 +142,26 @@ class FrankaShelfEnv(VecEnv):
         self.workspace_bounds_x, self.workspace_bounds_y, self.workspace_bounds_z = workspace_bounds_xyz
         self.dt = dt
         self.franka_xml_path = franka_xml_path
-        self.k_dist_reward, self.k_action_penalty = k_dist_reward, k_action_penalty
-        self.k_joint_limit_penalty, self.k_collision_penalty, self.k_accel_penalty = k_joint_limit_penalty, k_collision_penalty, k_accel_penalty
+        self.k_dist_reward = k_dist_reward
+        self.k_joint_limit_penalty = k_joint_limit_penalty
+        self.k_collision_penalty = k_collision_penalty
         self.success_reward = success_reward_val
 
         # --- Initialize Curriculum Components ---
-        if threshold_curriculum_cfg is None or velocity_penalty_curriculum_cfg is None:
+        if any(cfg is None for cfg in [threshold_curriculum_cfg, velocity_penalty_curriculum_cfg, action_penalty_curriculum_cfg, accel_penalty_curriculum_cfg, upright_bonus_curriculum_cfg]):
             raise ValueError(
-                "Curriculum configurations must be provided.")
+                "All curriculum configurations must be provided.")
 
         self.threshold_curriculum = LinearCurriculum(
             CurriculumConfig(**threshold_curriculum_cfg))
         self.velocity_penalty_curriculum = LinearCurriculum(
             CurriculumConfig(**velocity_penalty_curriculum_cfg))
+        self.action_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**action_penalty_curriculum_cfg))
+        self.accel_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**accel_penalty_curriculum_cfg))
+        self.upright_bonus_curriculum = LinearCurriculum(
+            CurriculumConfig(**upright_bonus_curriculum_cfg))
 
         self.min_episode_length_for_success_metric = min_episode_length_for_success_metric
         self.success_buffer = deque(maxlen=100 * self.num_envs)
@@ -153,11 +173,11 @@ class FrankaShelfEnv(VecEnv):
             {} for _ in range(self.num_envs)]
 
         # --- Initialize Genesis Scene ---
-        # The main viewer is controlled by the `render` flag.
         sim_viewer_options = gs.options.ViewerOptions(camera_pos=video_camera_pos, camera_lookat=video_camera_lookat, camera_fov=video_camera_fov,
                                                       res=video_res, max_FPS=60)
-        self.scene = gs.Scene(viewer_options=sim_viewer_options, sim_options=gs.options.SimOptions(
-            dt=self.dt), show_viewer=self.render)
+        sim_options = gs.options.SimOptions(dt=self.dt)
+        self.scene = gs.Scene(
+            viewer_options=sim_viewer_options, sim_options=sim_options, show_viewer=self.render)
 
         # Add a dedicated, non-GUI camera for video recording
         self.video_camera_params = {'res': video_res, 'pos': video_camera_pos,
@@ -218,7 +238,6 @@ class FrankaShelfEnv(VecEnv):
             name).dof_idx_local for name in self.FRANKA_JOINT_NAMES], dtype=np.int32)
         self.franka_arm_dof_indices_local = self.franka_all_dof_indices_local[
             :self.FRANKA_NUM_ARM_JOINTS]
-        self.max_allowable_joint_velocity_scale = 1.0
 
         # Initialize environment state
         self.reset()
@@ -560,10 +579,16 @@ class FrankaShelfEnv(VecEnv):
         # Update each curriculum component with the current success rate.
         self.threshold_curriculum.update(self.current_success_rate)
         self.velocity_penalty_curriculum.update(self.current_success_rate)
+        self.action_penalty_curriculum.update(self.current_success_rate)
+        self.accel_penalty_curriculum.update(self.current_success_rate)
+        self.upright_bonus_curriculum.update(self.current_success_rate)
 
         # Get the current values from the curriculum objects.
         current_success_threshold = self.threshold_curriculum.current_value
         current_vel_penalty = self.velocity_penalty_curriculum.current_value
+        current_action_penalty = self.action_penalty_curriculum.current_value
+        current_accel_penalty = self.accel_penalty_curriculum.current_value
+        current_upright_bonus = self.upright_bonus_curriculum.current_value
 
         # --- Dones ---
         # The success condition now uses the dynamic threshold from the curriculum.
@@ -589,7 +614,8 @@ class FrankaShelfEnv(VecEnv):
         # --- Reward Components ---
         reward_dist = -self.k_dist_reward * dist_to_target_batch
 
-        penalty_action_mag = -self.k_action_penalty * \
+        # Use the current penalty value from the curriculum
+        penalty_action_mag = -current_action_penalty * \
             np.sum(np.square(actions_clipped_batch), axis=1)
 
         out_of_bounds = (arm_joint_pos_batch < self.FRANKA_QPOS_LOWER) | (
@@ -611,16 +637,22 @@ class FrankaShelfEnv(VecEnv):
             terminated_success.astype(float) * velocity_reward_modulation
 
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
-        if self.k_accel_penalty > 0 and self.dt > 0:
+        if current_accel_penalty > 0 and self.dt > 0:
             acceleration_sq_sum = np.sum(
                 np.square(
                     (arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
-            penalty_accel = -self.k_accel_penalty * acceleration_sq_sum
+            penalty_accel = -current_accel_penalty * acceleration_sq_sum
+
+        # Upright bonus for torque control to encourage fighting gravity
+        upright_bonus = np.zeros(self.num_envs, dtype=np.float32)
+        if current_upright_bonus > 0:
+            upright_bonus = current_upright_bonus * \
+                (ee_pos_batch[:, 2] > 0.1).astype(np.float32)
 
         # Total reward
         rewards_np = reward_dist + penalty_action_mag + \
             penalty_joint_limit + penalty_collision + \
-            reward_success + penalty_accel
+            reward_success + penalty_accel + upright_bonus
         self.rew_buf = torch.from_numpy(rewards_np).to(self.device)
         self.episode_reward_buf += self.rew_buf
 
@@ -649,18 +681,22 @@ class FrankaShelfEnv(VecEnv):
             velocity_reward_modulation).to(self.device)
         self.extras["reward_components/accel_penalty"] = torch.from_numpy(
             penalty_accel).to(self.device)
+        self.extras["reward_components/upright_bonus"] = torch.from_numpy(
+            upright_bonus).to(self.device)
 
         # Add curriculum info for logging
         self.extras["curriculum/overall_success_rate"] = torch.tensor(
             self.current_success_rate, device=self.device)
         self.extras["curriculum/threshold_value"] = torch.tensor(
             self.threshold_curriculum.current_value, device=self.device)
-        self.extras["curriculum/threshold_progress"] = torch.tensor(
-            self.threshold_curriculum.progress, device=self.device)
         self.extras["curriculum/velocity_penalty_value"] = torch.tensor(
             self.velocity_penalty_curriculum.current_value, device=self.device)
-        self.extras["curriculum/velocity_penalty_progress"] = torch.tensor(
-            self.velocity_penalty_curriculum.progress, device=self.device)
+        self.extras["curriculum/action_penalty_value"] = torch.tensor(
+            self.action_penalty_curriculum.current_value, device=self.device)
+        self.extras["curriculum/accel_penalty_value"] = torch.tensor(
+            self.accel_penalty_curriculum.current_value, device=self.device)
+        self.extras["curriculum/upright_bonus_value"] = torch.tensor(
+            self.upright_bonus_curriculum.current_value, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):
@@ -680,12 +716,19 @@ class FrankaShelfEnv(VecEnv):
 
         self.actions = actions.clone()
 
-        # Apply actions
+        # --- Apply actions based on the selected control mode ---
         actions_clipped = torch.clamp(self.actions, -1.0, 1.0)
-        scaled_targets = actions_clipped * self.max_allowable_joint_velocity_scale * \
-            torch.from_numpy(self.FRANKA_VEL_LIMIT).to(self.device)
-        self.franka_entity.control_dofs_velocity(
-            scaled_targets, self.franka_arm_dof_indices_local)
+
+        if self.control_mode == 'velocity':
+            scaled_targets = actions_clipped * \
+                torch.from_numpy(self.FRANKA_VEL_LIMIT).to(self.device)
+            self.franka_entity.control_dofs_velocity(
+                scaled_targets, self.franka_arm_dof_indices_local)
+        elif self.control_mode == 'torque':
+            scaled_torques = actions_clipped * \
+                torch.from_numpy(self.FRANKA_TORQUE_LIMIT).to(self.device)
+            self.franka_entity.control_dofs_force(
+                scaled_torques, self.franka_arm_dof_indices_local)
 
         # Step simulation
         self.scene.step()
@@ -745,17 +788,15 @@ if __name__ == '__main__':
     # --- Test Configuration ---
     # This setup mirrors the structure in train_agent.py for consistency.
     test_threshold_curriculum_cfg = {
-        'start_value': 0.05,
-        'end_value': 0.005,
-        'start_metric_val': 0.4,
-        'end_metric_val': 0.8
-    }
+        'start_value': 0.05, 'end_value': 0.005, 'start_metric_val': 0.4, 'end_metric_val': 0.8}
     test_velocity_penalty_curriculum_cfg = {
-        'start_value': 0.0,
-        'end_value': 2.5,
-        'start_metric_val': 0.4,
-        'end_metric_val': 0.8
-    }
+        'start_value': 0.0, 'end_value': 2.5, 'start_metric_val': 0.4, 'end_metric_val': 0.8}
+    test_action_penalty_curriculum_cfg = {
+        'start_value': 0.0001, 'end_value': 0.0005, 'start_metric_val': 0.2, 'end_metric_val': 0.7}
+    test_accel_penalty_curriculum_cfg = {
+        'start_value': 0.0, 'end_value': 0.0001, 'start_metric_val': 0.4, 'end_metric_val': 0.8}
+    test_upright_bonus_curriculum_cfg = {
+        'start_value': 0.2, 'end_value': 0.0, 'start_metric_val': 0.5, 'end_metric_val': 0.9}
 
     num_test_envs_for_run = 5
     print(f"\n\n--- TESTING WITH NUM_ENVS = {num_test_envs_for_run} ---")
@@ -763,8 +804,12 @@ if __name__ == '__main__':
     try:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         env = FrankaShelfEnv(num_envs=num_test_envs_for_run,
+                             control_mode='torque',  # or 'velocity'
                              threshold_curriculum_cfg=test_threshold_curriculum_cfg,
                              velocity_penalty_curriculum_cfg=test_velocity_penalty_curriculum_cfg,
+                             action_penalty_curriculum_cfg=test_action_penalty_curriculum_cfg,
+                             accel_penalty_curriculum_cfg=test_accel_penalty_curriculum_cfg,
+                             upright_bonus_curriculum_cfg=test_upright_bonus_curriculum_cfg,
                              include_shelf=False,
                              randomize_shelf_config=False,
                              device=device,
@@ -790,11 +835,10 @@ if __name__ == '__main__':
             actions = torch.rand(
                 env.num_envs, env.num_actions, device=device) * 2 - 1
             obs, _, rewards, dones, infos = env.step(actions)
-            if (step_num + 1) % 50 == 0:
+            if (step_num + 1) % 100 == 0:
                 print(
                     f"Step {step_num+1}: Success Rate: {infos['curriculum/overall_success_rate']:.2f} | "
-                    f"Threshold: {infos['curriculum/threshold_value']:.4f} | "
-                    f"Vel Penalty: {infos['curriculum/velocity_penalty_value']:.2f}")
+                    f"Upright Bonus: {infos['curriculum/upright_bonus_value']:.4f}")
 
         print("\nBasic test loop finished.")
 

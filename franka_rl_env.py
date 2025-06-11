@@ -224,6 +224,10 @@ class FrankaShelfEnv(VecEnv):
         self.franka_entity = self.scene.add_entity(
             gs.morphs.MJCF(file=self.franka_xml_path))
 
+        # Get the index of the end-effector link for efficient velocity queries
+        self.ee_link_idx = self.franka_entity.get_link(
+            self.ROBOT_EE_LINK_NAME).idx
+
         self.shelf_component_entities: List[Any] = []
         if self.include_shelf:
             self.shelf_component_entities = [self.scene.add_entity(gs.morphs.Box(pos=(0, -10 - i * 0.5, 0), quat=(1, 0, 0, 0), size=tuple(
@@ -350,7 +354,7 @@ class FrankaShelfEnv(VecEnv):
         joint_pos_all_batch = to_numpy(
             self.franka_entity.get_dofs_position(self.franka_all_dof_indices_local))
         joint_vel_all_batch = to_numpy(
-            self.franka_entity.get_dofs_velocity(self.franka_all_dof_indices_local))
+            self.franka_entity.get_dofs_velocity(dofs_idx_local=self.franka_all_dof_indices_local))
         arm_joint_pos_batch = joint_pos_all_batch[:,
                                                   :self.FRANKA_NUM_ARM_JOINTS]
         arm_joint_vel_batch = joint_vel_all_batch[:,
@@ -360,8 +364,17 @@ class FrankaShelfEnv(VecEnv):
         ee_pos_batch = to_numpy(ee_link.get_pos())
         ee_orient_quat_wxyz_batch = to_numpy(ee_link.get_quat())
 
-        # Genesis returns velocity as a single (N, 6) tensor [vx, vy, vz, wx, wy, wz]
-        ee_vel_batch = to_numpy(ee_link.get_velocity())
+        # Get all link velocities and select the one for the end-effector
+        # Shape: (num_envs, num_links, 3)
+        all_links_vel = self.franka_entity.get_links_vel()
+        # Shape: (num_envs, num_links, 3)
+        all_links_ang = self.franka_entity.get_links_ang()
+        ee_linear_vel = all_links_vel[:, self.ee_link_idx, :]
+        ee_angular_vel = all_links_ang[:, self.ee_link_idx, :]
+
+        ee_vel_tensor = torch.cat(
+            [ee_linear_vel, ee_angular_vel], dim=1)  # Shape: (num_envs, 6)
+        ee_vel_batch = to_numpy(ee_vel_tensor)
 
         return arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, ee_orient_quat_wxyz_batch, ee_vel_batch
 
@@ -593,7 +606,7 @@ class FrankaShelfEnv(VecEnv):
             all_qpos = self.franka_entity.get_dofs_position(
                 self.franka_all_dof_indices_local)
             all_qvel = self.franka_entity.get_dofs_velocity(
-                self.franka_all_dof_indices_local)
+                dofs_idx_local=self.franka_all_dof_indices_local)
 
             qpos_tensor = torch.tensor(
                 initial_qpos, device=self.device, dtype=torch.float32)

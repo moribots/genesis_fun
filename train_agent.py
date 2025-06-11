@@ -330,8 +330,8 @@ class EnvConfig:
 
     # --- Proximity-based velocity penalty ---
     # How much to scale penalty at dist=0
-    proximity_vel_penalty_max_scale: float = 4.0
-    proximity_vel_penalty_dist_threshold: float = 0.2  # Dist at which scaling starts
+    proximity_vel_penalty_max_scale: float = 1.0
+    proximity_vel_penalty_dist_threshold: float = 0.05  # Dist at which scaling starts
 
     # Modular Curriculum Configurations (placeholders)
     threshold_curriculum: CurriculumConfig = field(default_factory=dict)
@@ -376,15 +376,15 @@ class EnvConfig:
 
             # For torque control, penalties and bonuses are gradually introduced/removed.
             self.action_penalty_curriculum = CurriculumConfig(
-                start_value=1.0e-5, end_value=1.0e-4, start_metric_val=0.5, end_metric_val=0.8)
+                start_value=1.0e-5, end_value=1.0e-4, start_metric_val=0.5, end_metric_val=0.9)
             self.accel_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=5.0e-5, start_metric_val=0.5, end_metric_val=0.8)
+                start_value=0.0, end_value=5.0e-5, start_metric_val=0.5, end_metric_val=0.9)
             self.jerk_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=1.0e-6, start_metric_val=0.6, end_metric_val=0.85)
+                start_value=0.0, end_value=1.0e-6, start_metric_val=0.6, end_metric_val=0.9)
             self.joint_velocity_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=0.05, start_metric_val=0.5, end_metric_val=0.8)
+                start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
             self.ee_velocity_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=0.1, start_metric_val=0.6, end_metric_val=0.85)
+                start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
             self.upright_bonus_curriculum = CurriculumConfig(
                 start_value=1.0, end_value=0.0, start_metric_val=0.0, end_metric_val=0.4)
             self.threshold_curriculum = CurriculumConfig(

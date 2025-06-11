@@ -38,8 +38,18 @@ def to_numpy(data: Union[torch.Tensor, np.ndarray, List, Tuple]) -> np.ndarray:
 class FrankaShelfEnv(VecEnv):
     """
     A vectorized environment for a Franka Emika Panda robot, adapted for RSL-RL.
-    Observations are a flattened tensor of robot state and relative target position.
+
+    Observations are fixed and include:
+    - Base robot state (joint positions, velocities, EE pose).
+    - Relative target position.
+    - End-effector linear and angular velocities.
+    - History of previous actions.
+
     Actions are continuous joint velocity or torque commands.
+
+    Rewards are shaped to encourage reaching a target smoothly and stably,
+    with configurable penalties for high acceleration and jerk. Joint and EE
+    velocity penalties are dynamically scaled based on proximity to the target.
     """
     # https://frankaemika.github.io/docs/control_parameters.html
     FRANKA_JOINT_NAMES: List[str] = ['joint1', 'joint2', 'joint3', 'joint4',
@@ -92,17 +102,24 @@ class FrankaShelfEnv(VecEnv):
                      (-1.0, 1.0), (-1.0, 1.0), (0.0, 1.5)),
                  dt: float = 0.01,
                  control_mode: str = 'velocity',
+                 num_actions_history: int = 1,
+                 # --- Reward & Curriculum Config ---
                  franka_xml_path: str = 'xml/franka_emika_panda/panda.xml',
                  k_dist_reward: float = 1.0,
                  k_joint_limit_penalty: float = 10.0,
                  k_collision_penalty: float = 100.0,
                  success_reward_val: float = 200.0,
+                 proximity_vel_penalty_max_scale: float = 4.0,
+                 proximity_vel_penalty_dist_threshold: float = 0.2,
                  threshold_curriculum_cfg: dict = None,
-                 velocity_penalty_curriculum_cfg: dict = None,
+                 joint_velocity_penalty_curriculum_cfg: dict = None,
+                 ee_velocity_penalty_curriculum_cfg: dict = None,
                  action_penalty_curriculum_cfg: dict = None,
                  accel_penalty_curriculum_cfg: dict = None,
+                 jerk_penalty_curriculum_cfg: dict = None,
                  upright_bonus_curriculum_cfg: dict = None,
                  min_episode_length_for_success_metric: int = 10,
+                 # --- Rendering & Video ---
                  video_camera_pos: Tuple[float,
                                          float, float] = (1.8, -1.8, 2.0),
                  video_camera_lookat: Tuple[float,
@@ -129,11 +146,17 @@ class FrankaShelfEnv(VecEnv):
             raise ValueError(
                 f"Invalid control_mode: {self.control_mode}. Must be 'velocity' or 'torque'.")
 
-        # RSL-RL specific attributes
+        # --- RSL-RL specific attributes ---
+        self.num_actions_history = num_actions_history
         robot_state_flat_dim = self.FRANKA_NUM_ARM_JOINTS * \
             2 + 3 + 4  # qpos, qvel, ee_pos, ee_quat
         relative_target_pos_dim = 3
-        self.num_obs = robot_state_flat_dim + relative_target_pos_dim
+        ee_vel_dim = 6
+        action_history_dim = self.FRANKA_NUM_ARM_JOINTS * \
+            self.num_actions_history if self.num_actions_history > 0 else 0
+
+        self.num_obs = robot_state_flat_dim + \
+            relative_target_pos_dim + ee_vel_dim + action_history_dim
         self.num_privileged_obs = 0
         self.num_actions = self.FRANKA_NUM_ARM_JOINTS
         self.max_episode_length = max_steps_per_episode
@@ -146,20 +169,31 @@ class FrankaShelfEnv(VecEnv):
         self.k_joint_limit_penalty = k_joint_limit_penalty
         self.k_collision_penalty = k_collision_penalty
         self.success_reward = success_reward_val
+        self.proximity_vel_penalty_max_scale = proximity_vel_penalty_max_scale
+        self.proximity_vel_penalty_dist_threshold = proximity_vel_penalty_dist_threshold
 
         # --- Initialize Curriculum Components ---
-        if any(cfg is None for cfg in [threshold_curriculum_cfg, velocity_penalty_curriculum_cfg, action_penalty_curriculum_cfg, accel_penalty_curriculum_cfg, upright_bonus_curriculum_cfg]):
-            raise ValueError(
-                "All curriculum configurations must be provided.")
+        required_curricula = [
+            threshold_curriculum_cfg, joint_velocity_penalty_curriculum_cfg,
+            ee_velocity_penalty_curriculum_cfg, action_penalty_curriculum_cfg,
+            accel_penalty_curriculum_cfg, jerk_penalty_curriculum_cfg,
+            upright_bonus_curriculum_cfg
+        ]
+        if any(cfg is None for cfg in required_curricula):
+            raise ValueError("All curriculum configurations must be provided.")
 
         self.threshold_curriculum = LinearCurriculum(
             CurriculumConfig(**threshold_curriculum_cfg))
-        self.velocity_penalty_curriculum = LinearCurriculum(
-            CurriculumConfig(**velocity_penalty_curriculum_cfg))
+        self.joint_velocity_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**joint_velocity_penalty_curriculum_cfg))
+        self.ee_velocity_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**ee_velocity_penalty_curriculum_cfg))
         self.action_penalty_curriculum = LinearCurriculum(
             CurriculumConfig(**action_penalty_curriculum_cfg))
         self.accel_penalty_curriculum = LinearCurriculum(
             CurriculumConfig(**accel_penalty_curriculum_cfg))
+        self.jerk_penalty_curriculum = LinearCurriculum(
+            CurriculumConfig(**jerk_penalty_curriculum_cfg))
         self.upright_bonus_curriculum = LinearCurriculum(
             CurriculumConfig(**upright_bonus_curriculum_cfg))
 
@@ -176,35 +210,35 @@ class FrankaShelfEnv(VecEnv):
         sim_viewer_options = gs.options.ViewerOptions(camera_pos=video_camera_pos, camera_lookat=video_camera_lookat, camera_fov=video_camera_fov,
                                                       res=video_res, max_FPS=60)
         sim_options = gs.options.SimOptions(dt=self.dt)
-        self.scene = gs.Scene(
-            viewer_options=sim_viewer_options, sim_options=sim_options, show_viewer=self.render)
+        self.scene = gs.Scene(viewer_options=sim_viewer_options,
+                              sim_options=sim_options, show_viewer=self.render)
 
         # Add a dedicated, non-GUI camera for video recording
         self.video_camera_params = {'res': video_res, 'pos': video_camera_pos,
                                     'lookat': video_camera_lookat, 'fov': video_camera_fov}
         self.video_capture_camera = self.scene.add_camera(
-            res=self.video_camera_params['res'], pos=self.video_camera_params['pos'],
-            lookat=self.video_camera_params['lookat'], fov=self.video_camera_params['fov'], GUI=False
-        )
+            res=self.video_camera_params['res'], pos=self.video_camera_params['pos'], lookat=self.video_camera_params['lookat'], fov=self.video_camera_params['fov'], GUI=False)
         self._is_recording = False
 
         self.plane_entity = self.scene.add_entity(gs.morphs.Plane())
         self.franka_entity = self.scene.add_entity(
             gs.morphs.MJCF(file=self.franka_xml_path))
 
+        # Get the index of the end-effector link for efficient velocity queries
+        self.ee_link_idx = self.franka_entity.get_link(
+            self.ROBOT_EE_LINK_NAME).idx
+
         self.shelf_component_entities: List[Any] = []
         if self.include_shelf:
-            self.shelf_component_entities = [self.scene.add_entity(gs.morphs.Box(pos=(0, -10 - i * 0.5, 0), quat=(
-                1, 0, 0, 0), size=tuple(s), fixed=True, collision=True, visualization=True)) for i, s in enumerate(self.FIXED_COMPONENT_SIZES)]
+            self.shelf_component_entities = [self.scene.add_entity(gs.morphs.Box(pos=(0, -10 - i * 0.5, 0), quat=(1, 0, 0, 0), size=tuple(
+                s), fixed=True, collision=True, visualization=True)) for i, s in enumerate(self.FIXED_COMPONENT_SIZES)]
         else:
             self.shelf_component_entities = []
 
         self.target_sphere_entity_type: Optional[Any] = None
         if self.scene and self.num_envs > 1:
-            self.target_sphere_entity_type = self.scene.add_entity(
-                gs.morphs.Sphere(pos=(0, -20, 0), radius=0.03,
-                                 visualization=True, collision=False, fixed=True)
-            )
+            self.target_sphere_entity_type = self.scene.add_entity(gs.morphs.Sphere(
+                pos=(0, -20, 0), radius=0.03, visualization=True, collision=False, fixed=True))
 
         if not self.scene.is_built:
             self.scene.build(n_envs=self.num_envs,
@@ -231,8 +265,14 @@ class FrankaShelfEnv(VecEnv):
             (self.num_envs, self.SHELF_NUM_COMPONENTS, self.NUM_PARAMS_PER_SHELF_COMPONENT), dtype=np.float32)
         self.target_position_world_batch = np.zeros(
             (self.num_envs, 3), dtype=np.float32)
+
+        # Buffers for new reward terms and observations
         self.prev_joint_vel_batch = np.zeros(
             (self.num_envs, self.FRANKA_NUM_ARM_JOINTS), dtype=np.float32)
+        self.prev_joint_accel_batch = np.zeros(
+            (self.num_envs, self.FRANKA_NUM_ARM_JOINTS), dtype=np.float32)
+        self.prev_actions_batch = np.zeros(
+            (self.num_envs, self.FRANKA_NUM_ARM_JOINTS * self.num_actions_history), dtype=np.float32)
 
         self.franka_all_dof_indices_local = np.array([self.franka_entity.get_joint(
             name).dof_idx_local for name in self.FRANKA_JOINT_NAMES], dtype=np.int32)
@@ -299,19 +339,44 @@ class FrankaShelfEnv(VecEnv):
                     raise ValueError(
                         f"Configuration '{key}' x_range {x_range_tuple} violates the buffer zone (-{buffer_half_width}, {buffer_half_width}).")
 
-    def _get_robot_state_parts_batched(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _get_robot_state_parts_batched(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Retrieves batched kinematic data for the robot.
+
+        Returns:
+            A tuple containing:
+            - arm_joint_pos_batch (np.ndarray): Joint positions.
+            - arm_joint_vel_batch (np.ndarray): Joint velocities.
+            - ee_pos_batch (np.ndarray): End-effector position.
+            - ee_orient_quat_wxyz_batch (np.ndarray): End-effector orientation.
+            - ee_vel_batch (np.ndarray): End-effector linear and angular velocity.
+        """
         joint_pos_all_batch = to_numpy(
             self.franka_entity.get_dofs_position(self.franka_all_dof_indices_local))
         joint_vel_all_batch = to_numpy(
-            self.franka_entity.get_dofs_velocity(self.franka_all_dof_indices_local))
+            self.franka_entity.get_dofs_velocity(dofs_idx_local=self.franka_all_dof_indices_local))
         arm_joint_pos_batch = joint_pos_all_batch[:,
                                                   :self.FRANKA_NUM_ARM_JOINTS]
         arm_joint_vel_batch = joint_vel_all_batch[:,
                                                   :self.FRANKA_NUM_ARM_JOINTS]
+
         ee_link = self.franka_entity.get_link(self.ROBOT_EE_LINK_NAME)
         ee_pos_batch = to_numpy(ee_link.get_pos())
         ee_orient_quat_wxyz_batch = to_numpy(ee_link.get_quat())
-        return arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, ee_orient_quat_wxyz_batch
+
+        # Get all link velocities and select the one for the end-effector
+        # Shape: (num_envs, num_links, 3)
+        all_links_vel = self.franka_entity.get_links_vel()
+        # Shape: (num_envs, num_links, 3)
+        all_links_ang = self.franka_entity.get_links_ang()
+        ee_linear_vel = all_links_vel[:, self.ee_link_idx, :]
+        ee_angular_vel = all_links_ang[:, self.ee_link_idx, :]
+
+        ee_vel_tensor = torch.cat(
+            [ee_linear_vel, ee_angular_vel], dim=1)  # Shape: (num_envs, 6)
+        ee_vel_batch = to_numpy(ee_vel_tensor)
+
+        return arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, ee_orient_quat_wxyz_batch, ee_vel_batch
 
     def _build_shelf_structure_and_populate_params_batched(self, env_ids: Union[np.ndarray, List[int]]) -> None:
         if not len(env_ids):
@@ -478,14 +543,27 @@ class FrankaShelfEnv(VecEnv):
 
     def _compute_observations(self) -> None:
         """Computes observations and populates self.obs_buf."""
-        arm_qpos, arm_qvel, ee_pos, ee_quat_wxyz = self._get_robot_state_parts_batched()
+        arm_qpos, arm_qvel, ee_pos, ee_quat_wxyz, ee_vel = self._get_robot_state_parts_batched()
+
+        # Base robot state
         robot_state_flat_batch = np.concatenate(
             [arm_qpos, arm_qvel, ee_pos, ee_quat_wxyz], axis=1).astype(np.float32)
+
+        # Relative target position
         relative_target_pos_batch = (
             self.target_position_world_batch - ee_pos).astype(np.float32)
 
-        obs_np = np.concatenate(
-            [robot_state_flat_batch, relative_target_pos_batch], axis=-1)
+        # Assemble the full observation
+        obs_parts = [
+            robot_state_flat_batch,
+            relative_target_pos_batch,
+            ee_vel.astype(np.float32)
+        ]
+
+        if self.num_actions_history > 0:
+            obs_parts.append(self.prev_actions_batch.astype(np.float32))
+
+        obs_np = np.concatenate(obs_parts, axis=-1)
         self.obs_buf = torch.from_numpy(obs_np).to(self.device)
         # Populate the extras dictionary as expected by the runner
         self.extras['observations'] = {}
@@ -528,7 +606,7 @@ class FrankaShelfEnv(VecEnv):
             all_qpos = self.franka_entity.get_dofs_position(
                 self.franka_all_dof_indices_local)
             all_qvel = self.franka_entity.get_dofs_velocity(
-                self.franka_all_dof_indices_local)
+                dofs_idx_local=self.franka_all_dof_indices_local)
 
             qpos_tensor = torch.tensor(
                 initial_qpos, device=self.device, dtype=torch.float32)
@@ -543,7 +621,11 @@ class FrankaShelfEnv(VecEnv):
             self.franka_entity.set_dofs_velocity(
                 all_qvel, self.franka_all_dof_indices_local)
 
+        # Reset custom buffers
         self.prev_joint_vel_batch[env_ids] = 0.0
+        self.prev_joint_accel_batch[env_ids] = 0.0
+        if self.num_actions_history > 0:
+            self.prev_actions_batch[env_ids] = 0.0
 
         # Randomize the shelf configuration for the new episode
         self._build_shelf_structure_and_populate_params_batched(env_ids)
@@ -566,7 +648,7 @@ class FrankaShelfEnv(VecEnv):
     def _calculate_rewards_and_dones(self) -> None:
         """Calculates rewards and dones and populates the buffers."""
         actions_clipped_batch = to_numpy(self.actions)
-        arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, _ = self._get_robot_state_parts_batched()
+        arm_joint_pos_batch, arm_joint_vel_batch, ee_pos_batch, _, ee_vel_batch = self._get_robot_state_parts_batched()
 
         dist_to_target_batch = np.linalg.norm(
             ee_pos_batch - self.target_position_world_batch, axis=1)
@@ -578,16 +660,21 @@ class FrankaShelfEnv(VecEnv):
 
         # Update each curriculum component with the current success rate.
         self.threshold_curriculum.update(self.current_success_rate)
-        self.velocity_penalty_curriculum.update(self.current_success_rate)
+        self.joint_velocity_penalty_curriculum.update(
+            self.current_success_rate)
+        self.ee_velocity_penalty_curriculum.update(self.current_success_rate)
         self.action_penalty_curriculum.update(self.current_success_rate)
         self.accel_penalty_curriculum.update(self.current_success_rate)
+        self.jerk_penalty_curriculum.update(self.current_success_rate)
         self.upright_bonus_curriculum.update(self.current_success_rate)
 
         # Get the current values from the curriculum objects.
         current_success_threshold = self.threshold_curriculum.current_value
-        current_vel_penalty = self.velocity_penalty_curriculum.current_value
+        current_joint_vel_penalty = self.joint_velocity_penalty_curriculum.current_value
+        current_ee_vel_penalty = self.ee_velocity_penalty_curriculum.current_value
         current_action_penalty = self.action_penalty_curriculum.current_value
         current_accel_penalty = self.accel_penalty_curriculum.current_value
+        current_jerk_penalty = self.jerk_penalty_curriculum.current_value
         current_upright_bonus = self.upright_bonus_curriculum.current_value
 
         # --- Dones ---
@@ -626,22 +713,42 @@ class FrankaShelfEnv(VecEnv):
         penalty_collision = -self.k_collision_penalty * \
             terminated_collision.astype(float)
 
+        # Dynamic velocity penalties based on proximity
+        proximity_scaling_factor = np.ones(self.num_envs, dtype=np.float32)
+        if self.proximity_vel_penalty_dist_threshold > 0:
+            close_mask = dist_to_target_batch < self.proximity_vel_penalty_dist_threshold
+            # Linearly scale from 1.0 (at threshold) up to `max_scale` (at dist 0)
+            normalized_dist_inv = 1.0 - \
+                (dist_to_target_batch[close_mask] /
+                 self.proximity_vel_penalty_dist_threshold)
+            proximity_scaling_factor[close_mask] += (
+                self.proximity_vel_penalty_max_scale - 1.0) * normalized_dist_inv
+
         joint_vel_magnitude = np.linalg.norm(arm_joint_vel_batch, axis=1)
+        penalty_joint_velocity = -current_joint_vel_penalty * \
+            joint_vel_magnitude * proximity_scaling_factor
 
-        # The modulation factor uses the velocity penalty from the curriculum.
-        velocity_reward_modulation = np.exp(
-            -current_vel_penalty * joint_vel_magnitude)
+        ee_vel_magnitude = np.linalg.norm(ee_vel_batch, axis=1)
+        penalty_ee_velocity = -current_ee_vel_penalty * \
+            ee_vel_magnitude * proximity_scaling_factor
 
-        # Apply this modulation only when the success condition is met.
-        reward_success = self.success_reward * \
-            terminated_success.astype(float) * velocity_reward_modulation
+        reward_success = self.success_reward * terminated_success.astype(float)
 
         penalty_accel = np.zeros(self.num_envs, dtype=np.float32)
-        if current_accel_penalty > 0 and self.dt > 0:
-            acceleration_sq_sum = np.sum(
-                np.square(
-                    (arm_joint_vel_batch - self.prev_joint_vel_batch) / self.dt), axis=1)
-            penalty_accel = -current_accel_penalty * acceleration_sq_sum
+        penalty_jerk = np.zeros(self.num_envs, dtype=np.float32)
+        if (current_accel_penalty > 0 or current_jerk_penalty > 0) and self.dt > 0:
+            current_accel = (arm_joint_vel_batch -
+                             self.prev_joint_vel_batch) / self.dt
+            if current_accel_penalty > 0:
+                penalty_accel = -current_accel_penalty * \
+                    np.sum(np.square(current_accel), axis=1)
+
+            if current_jerk_penalty > 0:
+                jerk = (current_accel - self.prev_joint_accel_batch) / self.dt
+                penalty_jerk = -current_jerk_penalty * \
+                    np.sum(np.square(jerk), axis=1)
+
+            self.prev_joint_accel_batch = current_accel.copy()
 
         # Upright bonus for torque control to encourage fighting gravity
         upright_bonus = np.zeros(self.num_envs, dtype=np.float32)
@@ -650,9 +757,9 @@ class FrankaShelfEnv(VecEnv):
                 (ee_pos_batch[:, 2] > 0.1).astype(np.float32)
 
         # Total reward
-        rewards_np = reward_dist + penalty_action_mag + \
-            penalty_joint_limit + penalty_collision + \
-            reward_success + penalty_accel + upright_bonus
+        rewards_np = (reward_dist + reward_success + penalty_action_mag +
+                      penalty_joint_limit + penalty_collision + penalty_joint_velocity +
+                      penalty_ee_velocity + penalty_accel + penalty_jerk + upright_bonus)
         self.rew_buf = torch.from_numpy(rewards_np).to(self.device)
         self.episode_reward_buf += self.rew_buf
 
@@ -667,36 +774,33 @@ class FrankaShelfEnv(VecEnv):
             dist_to_target_batch).to(self.device)
 
         # Add individual reward components
-        self.extras["reward_components/distance"] = torch.from_numpy(
-            reward_dist).to(self.device)
-        self.extras["reward_components/action_penalty"] = torch.from_numpy(
-            penalty_action_mag).to(self.device)
-        self.extras["reward_components/joint_limit_penalty"] = torch.from_numpy(
-            penalty_joint_limit).to(self.device)
-        self.extras["reward_components/collision_penalty"] = torch.from_numpy(
-            penalty_collision).to(self.device)
-        self.extras["reward_components/success_reward"] = torch.from_numpy(
-            reward_success).to(self.device)
-        self.extras["reward_components/velocity_reward_modulation"] = torch.from_numpy(
-            velocity_reward_modulation).to(self.device)
-        self.extras["reward_components/accel_penalty"] = torch.from_numpy(
-            penalty_accel).to(self.device)
-        self.extras["reward_components/upright_bonus"] = torch.from_numpy(
-            upright_bonus).to(self.device)
+        reward_components = {
+            "distance": reward_dist, "success": reward_success, "action_penalty": penalty_action_mag,
+            "joint_limit_penalty": penalty_joint_limit, "collision_penalty": penalty_collision,
+            "joint_velocity_penalty": penalty_joint_velocity, "ee_velocity_penalty": penalty_ee_velocity,
+            "accel_penalty": penalty_accel, "jerk_penalty": penalty_jerk, "upright_bonus": upright_bonus
+        }
+        for name, value in reward_components.items():
+            self.extras[f"reward_components/{name}"] = torch.from_numpy(
+                value).to(self.device)
+
+        self.extras["debug/proximity_scaling_factor"] = torch.from_numpy(
+            proximity_scaling_factor).to(self.device)
 
         # Add curriculum info for logging
-        self.extras["curriculum/overall_success_rate"] = torch.tensor(
-            self.current_success_rate, device=self.device)
-        self.extras["curriculum/threshold_value"] = torch.tensor(
-            self.threshold_curriculum.current_value, device=self.device)
-        self.extras["curriculum/velocity_penalty_value"] = torch.tensor(
-            self.velocity_penalty_curriculum.current_value, device=self.device)
-        self.extras["curriculum/action_penalty_value"] = torch.tensor(
-            self.action_penalty_curriculum.current_value, device=self.device)
-        self.extras["curriculum/accel_penalty_value"] = torch.tensor(
-            self.accel_penalty_curriculum.current_value, device=self.device)
-        self.extras["curriculum/upright_bonus_value"] = torch.tensor(
-            self.upright_bonus_curriculum.current_value, device=self.device)
+        curriculum_components = {
+            "overall_success_rate": self.current_success_rate,
+            "threshold_value": self.threshold_curriculum.current_value,
+            "joint_velocity_penalty_value": self.joint_velocity_penalty_curriculum.current_value,
+            "ee_velocity_penalty_value": self.ee_velocity_penalty_curriculum.current_value,
+            "action_penalty_value": self.action_penalty_curriculum.current_value,
+            "accel_penalty_value": self.accel_penalty_curriculum.current_value,
+            "jerk_penalty_value": self.jerk_penalty_curriculum.current_value,
+            "upright_bonus_value": self.upright_bonus_curriculum.current_value
+        }
+        for name, value in curriculum_components.items():
+            self.extras[f"curriculum/{name}"] = torch.tensor(
+                value, device=self.device)
 
         # Log episode info when an episode is done
         for i in range(self.num_envs):
@@ -719,6 +823,18 @@ class FrankaShelfEnv(VecEnv):
         # --- Apply actions based on the selected control mode ---
         actions_clipped = torch.clamp(self.actions, -1.0, 1.0)
 
+        # --- Update action history buffer ---
+        if self.num_actions_history > 0:
+            # Flatten the current action
+            current_action_flat = to_numpy(
+                actions_clipped).reshape(self.num_envs, -1)
+            # Roll the history buffer and insert the new action
+            self.prev_actions_batch = np.roll(
+                self.prev_actions_batch, shift=-self.FRANKA_NUM_ARM_JOINTS, axis=1)
+            self.prev_actions_batch[:, -
+                                    self.FRANKA_NUM_ARM_JOINTS:] = current_action_flat
+
+        # --- Apply actions ---
         if self.control_mode == 'velocity':
             scaled_targets = actions_clipped * \
                 torch.from_numpy(self.FRANKA_VEL_LIMIT).to(self.device)

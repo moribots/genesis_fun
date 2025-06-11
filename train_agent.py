@@ -376,11 +376,11 @@ class EnvConfig:
 
             # For torque control, penalties and bonuses are gradually introduced/removed.
             self.action_penalty_curriculum = CurriculumConfig(
-                start_value=1.0e-5, end_value=1.0e-4, start_metric_val=0.5, end_metric_val=0.9)
+                start_value=1.0e-4, end_value=1.0e-3, start_metric_val=0.0, end_metric_val=0.2)
             self.accel_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=1.0e-12, start_metric_val=0.5, end_metric_val=0.8)
+                start_value=0.0, end_value=1.0e-6, start_metric_val=0.4, end_metric_val=0.6)
             self.jerk_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=1.0e-12, start_metric_val=0.5, end_metric_val=0.8)
+                start_value=0.0, end_value=1.0e-12, start_metric_val=0.7, end_metric_val=0.8)
             self.joint_velocity_penalty_curriculum = CurriculumConfig(
                 start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
             self.ee_velocity_penalty_curriculum = CurriculumConfig(
@@ -388,7 +388,7 @@ class EnvConfig:
             self.upright_bonus_curriculum = CurriculumConfig(
                 start_value=1.0, end_value=0.0, start_metric_val=0.0, end_metric_val=0.4)
             self.threshold_curriculum = CurriculumConfig(
-                start_value=0.05, end_value=0.005, start_metric_val=0.6, end_metric_val=0.84)
+                start_value=0.05, end_value=0.005, start_metric_val=0.5, end_metric_val=0.84)
 
     include_shelf: bool = False
     randomize_shelf_config: bool = True

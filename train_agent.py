@@ -378,9 +378,9 @@ class EnvConfig:
             self.action_penalty_curriculum = CurriculumConfig(
                 start_value=1.0e-5, end_value=1.0e-4, start_metric_val=0.5, end_metric_val=0.9)
             self.accel_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=5.0e-5, start_metric_val=0.5, end_metric_val=0.9)
+                start_value=0.0, end_value=1.0e-12, start_metric_val=0.5, end_metric_val=0.8)
             self.jerk_penalty_curriculum = CurriculumConfig(
-                start_value=0.0, end_value=1.0e-10, start_metric_val=0.6, end_metric_val=0.9)
+                start_value=0.0, end_value=1.0e-12, start_metric_val=0.5, end_metric_val=0.8)
             self.joint_velocity_penalty_curriculum = CurriculumConfig(
                 start_value=0.0, end_value=0.5, start_metric_val=0.85, end_metric_val=0.95)
             self.ee_velocity_penalty_curriculum = CurriculumConfig(

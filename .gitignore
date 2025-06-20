@@ -1,5 +1,21 @@
-__pycache__/*
-wandb/*
-training_logs/*
-videos_env_test/*
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.egg
+
+# Logs and Videos
+training_logs/
+videos_env_test/
+wandb/
 *.log

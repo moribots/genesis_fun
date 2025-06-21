@@ -17,13 +17,19 @@ from dataclasses import dataclass
 @dataclass
 class CurriculumConfig:
     """
-    Configuration for a curriculum component.
+    Configuration dataclass for a curriculum component.
+
+    This structure holds the parameters that define how a value should be
+    scheduled over the course of training based on a performance metric.
 
     Attributes:
         start_value: The initial value of the parameter being scheduled.
         end_value: The final value of the parameter once the curriculum is complete.
         start_metric_val: The metric value at which the curriculum begins to progress.
-        end_metric_val: The metric value at which the curriculum is considered complete.
+                          Before this point, the value remains `start_value`.
+        end_metric_val: The metric value at which the curriculum is considered
+                        complete. At or beyond this point, the value will be
+                        `end_value`.
     """
     start_value: float
     end_value: float
@@ -45,11 +51,12 @@ class Curriculum(abc.ABC):
         Initializes the curriculum.
 
         Args:
-            config: A `CurriculumConfig` object containing the parameters for the curriculum.
+            config: A `CurriculumConfig` object containing the parameters
+                    for the curriculum.
         """
         self.config = config
-        self._current_value = self.config.start_value
-        self._progress = 0.0
+        self._current_value: float = self.config.start_value
+        self._progress: float = 0.0
 
     @abc.abstractmethod
     def update(self, metric_value: float):
@@ -95,6 +102,9 @@ class LinearCurriculum(Curriculum):
         `start_metric_val` and `end_metric_val`. If the metric is below the start
         threshold, the progress is 0. If it's above the end threshold, the
         progress is 1.
+
+        Args:
+            metric_value: The current value of the performance metric.
         """
         # Avoid division by zero if the metric range is invalid.
         if self.config.end_metric_val <= self.config.start_metric_val:
@@ -103,6 +113,7 @@ class LinearCurriculum(Curriculum):
             # Calculate progress as a fraction of the way through the metric range.
             raw_progress = (metric_value - self.config.start_metric_val) / \
                 (self.config.end_metric_val - self.config.start_metric_val)
+
             # Clamp the progress to be within the [0, 1] range.
             self._progress = max(0.0, min(1.0, raw_progress))
 

@@ -1,0 +1,61 @@
+graph TD
+    style UserEntryPoint fill:#f9f,stroke:#333,stroke-width:2px
+    style Configs fill:#ffe4c4,stroke:#333,stroke-width:2px
+    style SimAgnostic fill:#d1e7dd,stroke:#333,stroke-width:2px
+    style SimBridge fill:#cff4fc,stroke:#333,stroke-width:2px
+    style Libs fill:#f5f5f5,stroke:#333,stroke-width:1px
+
+    subgraph UserEntryPoint[User Entry Point]
+        TrainAgent["<b>train_agent.py</b><br>run_franka_training()"]
+    end
+
+    subgraph Configs[Configuration Dataclasses]
+        TrainConfig["<b>TrainConfig</b>"]
+        RunnerConfig["RunnerConfig"]
+        EnvConfig["EnvConfig"]
+        AlgoConfig["AlgorithmConfig"]
+        PolicyConfig["PolicyConfig"]
+    end
+
+    subgraph SimAgnostic[Simulator-Agnostic Core]
+        CustomRunner["<b>CustomOnPolicyRunner</b><br>(training_core.py)"]
+        BaseEnv["<i>BaseFrankaEnv (Abstract)</i><br>(env_core.py)"]
+        TaskLogic["FrankaTaskLogic<br>(task_logic.py)"]
+        Curriculum["LinearCurriculum<br>(curriculum_core.py)"]
+    end
+
+    subgraph SimBridge[Genesis Simulator Bridge]
+        GenesisEnv["<b>GenesisFrankaEnv</b><br>(genesis_env.py)"]
+        GenesisAPI["GenesisAPI<br>(genesis_api.py)"]
+    end
+    
+    subgraph Libs[External Libraries]
+        RSLRunner["(from rsl_rl)<br>OnPolicyRunner"]
+        GenesisLib["(from genesis-robotics)"]
+    end
+
+    %% Configuration Structure
+    TrainConfig --> RunnerConfig
+    TrainConfig --> EnvConfig
+    TrainConfig --> AlgoConfig
+    TrainConfig --> PolicyConfig
+
+    %% Main Execution Flow
+    TrainAgent --> TrainConfig
+    TrainAgent --> GenesisEnv
+    TrainAgent --> CustomRunner
+    CustomRunner --> LearnLoop("learn() Training Loop")
+
+    %% Runner Logic & Inheritance
+    CustomRunner --|> RSLRunner
+    LearnLoop --> GenesisEnv
+    LearnLoop --> AlgoConfig
+
+    %% Environment Logic & Inheritance
+    GenesisEnv --|> BaseEnv
+    GenesisEnv --> GenesisAPI
+    GenesisEnv --> TaskLogic
+    GenesisEnv --> Curriculum
+
+    %% Bridge to Simulator
+    GenesisAPI --> GenesisLib

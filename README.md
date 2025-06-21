@@ -26,6 +26,8 @@ franka_rl_framework/
 └── README.md
 ```
 
+![alt text](RLFranka.png)
+
 The codebase is organized into two main packages, which separate the core logic from the simulator-specific implementation:
 
 * `sim_agnostic_core/`: This directory contains all the high-level reinforcement learning logic that is independent of any specific simulator.

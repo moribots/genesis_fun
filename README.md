@@ -1,4 +1,4 @@
-# Simulator-Agnostic Franka RL Training
+# Franka in Genesis
 
 This project provides a framework for training a Franka Emika Panda robot for trajectory-tracking tasks using reinforcement learning. The agent currently considers joint limit and self collision awareness. The next phase will involve incorporating external collisions.
 
